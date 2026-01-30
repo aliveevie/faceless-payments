@@ -1,17 +1,53 @@
-import { useParams, Link } from 'react-router-dom';
+import { useParams, Link, useSearchParams } from 'react-router-dom';
 import { motion } from 'framer-motion';
+import { useEffect, useState } from 'react';
 import { Header } from '@/components/Header';
 import { PaymentForm } from '@/components/PaymentForm';
-import { useInvoices } from '@/contexts/InvoiceContext';
+import { useInvoices, Invoice } from '@/contexts/InvoiceContext';
 import { Button } from '@/components/ui/button';
 import { FileX, Home } from 'lucide-react';
 import { Logo } from '@/components/Logo';
 
 const PayInvoice = () => {
   const { id } = useParams<{ id: string }>();
-  const { getInvoice } = useInvoices();
+  const [searchParams] = useSearchParams();
+  const { getInvoice, invoices, ensureInvoice } = useInvoices();
+  const [invoice, setInvoice] = useState<Invoice | undefined>(undefined);
   
-  const invoice = id ? getInvoice(id) : undefined;
+  // Update invoice when context changes (after payment)
+  useEffect(() => {
+    if (id) {
+      // Always check invoices array first (most up-to-date)
+      let foundInvoice = invoices.find(inv => inv.id === id);
+      
+      if (foundInvoice) {
+        // Invoice exists in context - use it
+        console.log('Found invoice in context:', foundInvoice);
+        setInvoice(foundInvoice);
+      } else {
+        // If not found in context, try to reconstruct from URL query parameters
+        const amount = searchParams.get('amount');
+        const description = searchParams.get('description');
+        const recipient = searchParams.get('recipient');
+        
+        if (amount && recipient) {
+          // Reconstruct invoice from URL parameters
+          const tempInvoice: Invoice = {
+            id: id,
+            amount: parseFloat(amount),
+            description: description || 'Payment request',
+            recipientAddress: recipient,
+            createdAt: new Date(),
+            status: 'pending' as const,
+          };
+          
+          // CRITICAL: Ensure invoice exists in context so it can be updated when paid
+          foundInvoice = ensureInvoice(tempInvoice);
+          setInvoice(foundInvoice);
+        }
+      }
+    }
+  }, [id, getInvoice, searchParams, invoices, ensureInvoice]); // Re-run when invoices change
 
   return (
     <div className="min-h-screen bg-background">
@@ -28,10 +64,12 @@ const PayInvoice = () => {
               <div className="text-center mb-8">
                 <Logo size="lg" />
                 <p className="text-muted-foreground mt-4">
-                  You've received a payment request
+                  {invoice.status === 'paid' 
+                    ? 'Payment request has been paid' 
+                    : 'You\'ve received a payment request'}
                 </p>
               </div>
-              <PaymentForm invoice={invoice} />
+              <PaymentForm invoice={invoice} key={invoice.id} />
             </>
           ) : (
             <div className="glass-card p-12 text-center">
