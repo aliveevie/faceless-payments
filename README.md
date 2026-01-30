@@ -1,73 +1,164 @@
-# Welcome to your Lovable project
+# Faceless Payments
 
-## Project info
+**Privacy-first invoicing for freelancers on Solana** — Built with [ShadowWire](https://radr.dev/shadowwire) for the Privacy Hackathon 2026
 
-**URL**: https://lovable.dev/projects/REPLACE_WITH_PROJECT_ID
+## Overview
 
-## How can I edit this code?
+Faceless Payments is a privacy-focused invoicing application that lets freelancers and businesses create invoices and receive payments with hidden transaction amounts and optional sender anonymity. Built on Solana mainnet, it leverages ShadowWire's zero-knowledge proof system to enable truly private payments.
 
-There are several ways of editing your application.
+### Key Features
 
-**Use Lovable**
+- **Private Invoices**: Create invoices in SOL or USD1 stablecoin
+- **ShadowWire Integration**: Two privacy modes for payers:
+  - **Private Mode**: Hides the payment amount using bulletproof ZK proofs (sender visible)
+  - **Anonymous Mode**: Hides both the sender identity and amount (complete anonymity)
+- **Multi-Token Support**: Native SOL and USD1 stablecoin invoices
+- **Mainnet-Only**: Real privacy on Solana mainnet (ShadowWire only works on mainnet)
+- **Shareable Links**: QR codes and share links for Telegram/WhatsApp
 
-Simply visit the [Lovable Project](https://lovable.dev/projects/REPLACE_WITH_PROJECT_ID) and start prompting.
+## How ShadowWire Integration Works
 
-Changes made via Lovable will be committed automatically to this repo.
+### For Invoice Recipients (Freelancers)
+1. Connect your Solana wallet
+2. Create an invoice specifying amount (SOL or USD1) and description
+3. Share the invoice link with your client
+4. Receive private payments directly to your wallet
 
-**Use your preferred IDE**
+### For Payers (Clients)
+1. Open the invoice link
+2. Connect your Solana wallet
+3. Choose payment mode:
+   - **Private**: Your wallet is visible, but the amount is hidden on-chain
+   - **Anonymous**: Both your identity and the amount are hidden
+4. Ensure you have sufficient ShadowWire pool balance (deposit if needed)
+5. Complete the payment
 
-If you want to work locally using your own IDE, you can clone this repo and push changes. Pushed changes will also be reflected in Lovable.
+### Technical Implementation
 
-The only requirement is having Node.js & npm installed - [install with nvm](https://github.com/nvm-sh/nvm#installing-and-updating)
+```
+src/
+├── lib/
+│   ├── shadowwire.ts    # ShadowWire SDK wrapper with privacy transfer logic
+│   └── solana.ts        # Solana mainnet configuration
+├── components/
+│   ├── PaymentForm.tsx  # ShadowWire payment UI with mode selection
+│   ├── CreateInvoiceForm.tsx  # Multi-token invoice creation
+│   └── InvoiceCard.tsx  # Invoice display with privacy badges
+└── contexts/
+    ├── InvoiceContext.tsx  # Invoice state with token support
+    └── WalletContext.tsx   # Mainnet wallet provider
+```
 
-Follow these steps:
+The app uses the `@radr/shadowwire` SDK to:
+- Check user's ShadowWire pool balance
+- Execute private transfers (internal pool transfers with ZK proofs)
+- Execute anonymous transfers (external transfers with hidden sender)
+- Handle both SOL and USD1 tokens with proper decimals
 
-```sh
-# Step 1: Clone the repository using the project's Git URL.
-git clone <YOUR_GIT_URL>
+## USD1 Stablecoin Support
 
-# Step 2: Navigate to the project directory.
-cd <YOUR_PROJECT_NAME>
+USD1 is fully supported for stable-value invoices:
 
-# Step 3: Install the necessary dependencies.
-npm i
+| Token | Minimum Amount | ShadowWire Fee | Use Case |
+|-------|---------------|----------------|----------|
+| SOL   | 0.1 SOL       | 0.5%           | Native payments |
+| USD1  | 1 USD1        | 0.3%           | Stable-value invoices |
 
-# Step 4: Start the development server with auto-reloading and an instant preview.
+When creating an invoice, select the token type. Payers must pay in the specified token — they cannot change it.
+
+## Installation
+
+```bash
+# Clone the repository
+git clone https://github.com/your-repo/faceless-payments
+cd faceless-payments
+
+# Install dependencies (includes local ShadowWire SDK)
+npm install
+
+# Start development server
 npm run dev
 ```
 
-**Edit a file directly in GitHub**
+The app will be available at `http://localhost:5173`
 
-- Navigate to the desired file(s).
-- Click the "Edit" button (pencil icon) at the top right of the file view.
-- Make your changes and commit the changes.
+## Demo Instructions
 
-**Use GitHub Codespaces**
+### Prerequisites
+- A Solana wallet (Phantom or Solflare recommended)
+- Mainnet SOL for gas fees
+- ShadowWire pool balance (deposit SOL or USD1 first)
 
-- Navigate to the main page of your repository.
-- Click on the "Code" button (green button) near the top right.
-- Select the "Codespaces" tab.
-- Click on "New codespace" to launch a new Codespace environment.
-- Edit files directly within the Codespace and commit and push your changes once you're done.
+### Creating an Invoice
+1. Navigate to the app and connect your wallet
+2. Click "New Invoice"
+3. Select token (SOL or USD1)
+4. Enter amount (min 0.1 SOL or 1 USD1)
+5. Add description
+6. Click "Generate Invoice"
+7. Share the link via QR code, Telegram, or WhatsApp
 
-## What technologies are used for this project?
+### Paying an Invoice
+1. Open the invoice link
+2. Connect your wallet
+3. Select privacy mode:
+   - **Private**: Faster, amount hidden, sender visible
+   - **Anonymous**: Full privacy, both hidden
+4. If pool balance is zero, you'll see a prompt to deposit first
+5. Click "Pay Invoice"
+6. Approve the transaction in your wallet
 
-This project is built with:
+### Verifying Privacy
+After payment:
+1. Check the transaction on Solscan (link provided in the app)
+2. **Private payments**: You'll see the sender wallet but NOT the exact amount transferred
+3. **Anonymous payments**: The transaction shows the ShadowWire pool as the sender, not the payer's wallet
 
-- Vite
-- TypeScript
-- React
-- shadcn-ui
-- Tailwind CSS
+## Tech Stack
 
-## How can I deploy this project?
+- **Frontend**: React + TypeScript + Vite
+- **Styling**: Tailwind CSS + shadcn/ui
+- **Blockchain**: Solana Web3.js
+- **Wallets**: Solana Wallet Adapter (Phantom, Solflare)
+- **Privacy**: ShadowWire SDK (@radr/shadowwire)
+- **UI**: Framer Motion, Lucide Icons
 
-Simply open [Lovable](https://lovable.dev/projects/REPLACE_WITH_PROJECT_ID) and click on Share -> Publish.
+## Project Structure
 
-## Can I connect a custom domain to my Lovable project?
+```
+faceless-payments/
+├── ShadowWire/          # Local ShadowWire SDK
+├── src/
+│   ├── components/      # React components
+│   ├── contexts/        # React contexts (Wallet, Invoice)
+│   ├── lib/             # Utilities (shadowwire, solana)
+│   ├── pages/           # Route pages
+│   └── index.css        # Global styles
+├── package.json         # Dependencies (includes @radr/shadowwire)
+└── vite.config.ts       # Vite configuration
+```
 
-Yes, you can!
+## Bounty Submission
 
-To connect a domain, navigate to Project > Settings > Domains and click Connect Domain.
+**Privacy Hackathon 2026 - Radr Labs ShadowWire Bounty**
 
-Read more here: [Setting up a custom domain](https://docs.lovable.dev/features/custom-domain#custom-domain)
+This submission targets:
+- **Grand Prize ($10,000)**: Best overall ShadowWire integration
+- **Best USD1 Integration ($2,500)**: Full USD1 stablecoin support
+- **Best Integration to Existing App ($2,500)**: Privacy layer for real-world invoicing
+
+### What Makes This Submission Stand Out
+
+1. **Real Use Case**: Privacy invoicing solves a genuine problem for freelancers who want financial privacy
+2. **Complete USD1 Support**: Full stablecoin workflow from invoice creation to private payment
+3. **Two Privacy Modes**: Users can choose between private (faster) and anonymous (more private)
+4. **Production-Ready**: Mainnet-only, proper error handling, deposit prompts when balance is zero
+5. **Clean UX**: Simple invoice creation, shareable links, clear privacy badges
+
+## License
+
+MIT
+
+---
+
+Built for the Privacy Hackathon 2026 by targeting the [Radr Labs ShadowWire bounty](https://radr.dev/bounty)
