@@ -6,6 +6,8 @@
 
 Faceless Payments is a privacy-focused invoicing application that lets freelancers and businesses create invoices and receive payments with hidden transaction amounts and optional sender anonymity. Built on Solana mainnet, it leverages ShadowWire's zero-knowledge proof system to enable truly private payments.
 
+## Radr Lab Integration PR: https://github.com/aliveevie/faceless-payments/pull/1
+
 ### Key Features
 
 - **Private Invoices**: Create invoices in SOL or USD1 stablecoin
@@ -80,7 +82,7 @@ npm install
 npm run dev
 ```
 
-The app will be available at `http://localhost:5173`
+The app will be available at `http://localhost:8080`
 
 ## Demo Instructions
 
