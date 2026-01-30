@@ -1,16 +1,16 @@
 import { useEffect, useMemo, useState } from "react";
 import { useConnection, useWallet } from "@solana/wallet-adapter-react";
 import { WalletMultiButton } from "@solana/wallet-adapter-react-ui";
-import { LAMPORTS_PER_SOL, PublicKey, SystemProgram, Transaction } from "@solana/web3.js";
+import { Transaction } from "@solana/web3.js";
 import { motion } from "framer-motion";
-import { ArrowRight, AlertCircle, CheckCircle2, ExternalLink, Loader2, Wallet } from "lucide-react";
+import { ArrowRight, AlertCircle, CheckCircle2, ExternalLink, Loader2, Wallet, Shield, EyeOff, Info, RefreshCw } from "lucide-react";
 import { toast } from "sonner";
 
-import { Invoice, useInvoices } from "@/contexts/InvoiceContext";
+import { Invoice, InvoiceToken, useInvoices } from "@/contexts/InvoiceContext";
 import { Button } from "./ui/button";
-import { getSolanaCluster, getSolscanTxUrl, setSolanaCluster } from "@/lib/solana";
+import { getSolscanTxUrl, verifyPaymentReceived } from "@/lib/solana";
 
-// ShadowWire (aligned with `ShadowWire/examples/react-example.tsx`)
+// ShadowWire SDK
 import wasmUrl from "@radr/shadowwire/wasm/settler_wasm_bg.wasm?url";
 import {
   ShadowWireClient,
@@ -20,59 +20,149 @@ import {
   RecipientNotFoundError,
 } from "@radr/shadowwire";
 
+// Token configuration for ShadowWire (mainnet-only)
+const TOKEN_INFO: Record<InvoiceToken, { name: string; decimals: number; minAmount: number; feePercent: number }> = {
+  SOL: { name: "Solana", decimals: 9, minAmount: 0.1, feePercent: 0.5 },
+  USD1: { name: "USD1 Stablecoin", decimals: 6, minAmount: 1, feePercent: 0.3 },
+};
+
 interface PaymentFormProps {
   invoice: Invoice;
 }
-
-type TransferMode = "normal" | "shadowwire_private" | "shadowwire_anonymous";
 
 export function PaymentForm({ invoice: initialInvoice }: PaymentFormProps) {
   const { publicKey, connected, signMessage, signTransaction, sendTransaction } = useWallet();
   const { connection } = useConnection();
   const { upsertInvoice, invoices } = useInvoices();
-  
+
   // Get the latest invoice from context to keep it in sync
   const [invoice, setInvoice] = useState<Invoice>(initialInvoice);
-  
+
   // Update invoice when context changes (after payment)
   useEffect(() => {
     const latestInvoice = invoices.find(inv => inv.id === initialInvoice.id);
     if (latestInvoice) {
-      console.log('Invoice updated from context:', latestInvoice);
       setInvoice(latestInvoice);
-      // Also update isPaid state
       if (latestInvoice.status === 'paid') {
         setIsPaid(true);
       }
     }
   }, [invoices, initialInvoice.id]);
-  
-  const [client] = useState(() => new ShadowWireClient());
+
+  // Enable debug mode to see API requests/responses in console
+  const [client] = useState(() => new ShadowWireClient({ debug: true }));
   const [wasmInitialized, setWasmInitialized] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
   const [isPaid, setIsPaid] = useState(invoice.status === 'paid');
   const [transactionSignature, setTransactionSignature] = useState<string | null>(null);
-  const [balanceSOL, setBalanceSOL] = useState<number | null>(null);
+  const [poolBalance, setPoolBalance] = useState<number | null>(null);
   const [shadowWireError, setShadowWireError] = useState<string | null>(null);
-  const [transferMode, setTransferMode] = useState<TransferMode>("normal");
-  const [cluster, setCluster] = useState(getSolanaCluster());
+  const [isVerifyingPayment, setIsVerifyingPayment] = useState(false);
+
+  // Use invoice's token (SOL or USD1) - payer must pay in the requested token
+  const invoiceToken: InvoiceToken = invoice.token || 'SOL';
+  const tokenInfo = TOKEN_INFO[invoiceToken];
+
+  // Calculate fees for ShadowWire transfers
+  // Fee is deducted from amount - recipient gets (amount - fee)
+  const feeInfo = useMemo(() => {
+    const fee = invoice.amount * (tokenInfo.feePercent / 100);
+    return {
+      feePercent: tokenInfo.feePercent,
+      fee: fee,
+      netToRecipient: invoice.amount - fee, // What recipient actually gets
+      minAmount: tokenInfo.minAmount,
+      isBelowMin: invoice.amount < tokenInfo.minAmount,
+    };
+  }, [invoice.amount, tokenInfo]);
 
   const explorerUrl = useMemo(() => {
     const sig = transactionSignature || invoice.transactionSignature;
     return sig ? getSolscanTxUrl(sig) : null;
   }, [transactionSignature, invoice.transactionSignature]);
-  
+
   // Update isPaid when invoice status changes
   useEffect(() => {
     setIsPaid(invoice.status === 'paid');
   }, [invoice.status]);
 
-  const switchNetwork = (next: typeof cluster) => {
-    setSolanaCluster(next);
-    // Wallet adapter connection endpoint is configured at provider init.
-    // Reload is the most reliable way to rewire the connection.
-    window.location.reload();
-  };
+  // AUTOMATIC PAYMENT VERIFICATION
+  // Poll the blockchain to detect when payment has been received
+  // This runs for ANY viewer of a pending invoice - no wallet connection required
+  useEffect(() => {
+    // Don't verify if already paid
+    if (invoice.status === 'paid' || isPaid) {
+      return;
+    }
+
+    let isCancelled = false;
+    let pollCount = 0;
+    const maxPolls = 60; // Poll for up to 5 minutes (60 * 5 seconds)
+    const pollInterval = 5000; // 5 seconds between checks
+
+    const verifyPayment = async () => {
+      if (isCancelled || pollCount >= maxPolls) return;
+
+      setIsVerifyingPayment(true);
+      pollCount++;
+
+      try {
+        console.log(`[AutoVerify] Checking for payment (attempt ${pollCount}/${maxPolls})...`);
+
+        const result = await verifyPaymentReceived(
+          connection,
+          invoice.recipientAddress,
+          invoice.amount,
+          invoiceToken,
+          invoice.createdAt // Only check transactions after invoice was created
+        );
+
+        if (result.found && result.signature) {
+          console.log("[AutoVerify] Payment detected!", result);
+
+          // Update invoice status
+          upsertInvoice({
+            ...invoice,
+            status: "paid",
+            paidAt: result.timestamp ? new Date(result.timestamp * 1000) : new Date(),
+            transactionSignature: result.signature,
+            paymentMethod: "shadowwire",
+            isAnonymous: true, // ShadowWire payments are anonymous
+          });
+
+          setTransactionSignature(result.signature);
+          setIsPaid(true);
+
+          toast.success("Payment verified!", {
+            description: `Received ${result.amount?.toFixed(4)} ${invoiceToken}`,
+            action: {
+              label: "View on Solscan",
+              onClick: () => window.open(getSolscanTxUrl(result.signature!), "_blank"),
+            },
+          });
+
+          return; // Stop polling
+        }
+      } catch (err) {
+        console.warn("[AutoVerify] Verification check failed:", err);
+      } finally {
+        setIsVerifyingPayment(false);
+      }
+
+      // Schedule next poll if not cancelled
+      if (!isCancelled && pollCount < maxPolls) {
+        setTimeout(verifyPayment, pollInterval);
+      }
+    };
+
+    // Start polling after a short delay
+    const startDelay = setTimeout(verifyPayment, 2000);
+
+    return () => {
+      isCancelled = true;
+      clearTimeout(startDelay);
+    };
+  }, [invoice.id, invoice.status, invoice.recipientAddress, invoice.amount, invoiceToken, isPaid, connection, upsertInvoice]);
 
   const decodeBase64ToUint8Array = (b64: string): Uint8Array => {
     const binStr = globalThis.atob(b64);
@@ -83,64 +173,85 @@ export function PaymentForm({ invoice: initialInvoice }: PaymentFormProps) {
     return bytes;
   };
 
+  // Validate that a signature looks like a valid Solana transaction signature
+  // Valid signatures are 88 characters in base58 (64 bytes)
+  const isValidSignature = (sig: string): boolean => {
+    if (!sig || typeof sig !== 'string') return false;
+    // Solana signatures are 64 bytes = 88 characters in base58
+    // Allow some flexibility (85-90 chars) for encoding variations
+    if (sig.length < 85 || sig.length > 90) return false;
+    // Must be valid base58 characters
+    const base58Regex = /^[1-9A-HJ-NP-Za-km-z]+$/;
+    return base58Regex.test(sig);
+  };
+
   const confirmSignature = async (signature: string, timeoutMs: number = 60_000): Promise<boolean> => {
+    // Validate signature format first to avoid RPC errors
+    if (!isValidSignature(signature)) {
+      console.warn("Invalid signature format:", signature);
+      throw new Error(`Invalid signature format: ${signature?.slice(0, 20)}...`);
+    }
+
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
-      const status = await connection.getSignatureStatus(signature, { searchTransactionHistory: true });
-      if (status.value?.err) {
-        throw new Error(`Transaction failed: ${JSON.stringify(status.value.err)}`);
+      try {
+        const status = await connection.getSignatureStatus(signature, { searchTransactionHistory: true });
+        if (status.value?.err) {
+          throw new Error(`Transaction failed: ${JSON.stringify(status.value.err)}`);
+        }
+        if (status.value?.confirmationStatus === "confirmed" || status.value?.confirmationStatus === "finalized") {
+          return true;
+        }
+      } catch (err: any) {
+        // If RPC error (like WrongSize), don't keep retrying
+        if (err?.message?.includes("WrongSize") || err?.message?.includes("Invalid param")) {
+          console.error("RPC error checking signature:", err);
+          throw new Error(`RPC error: ${err.message}`);
+        }
+        // Other transient errors, continue polling
+        console.warn("Transient error checking signature:", err);
       }
-      if (
-        status.value?.confirmationStatus === "confirmed" ||
-        status.value?.confirmationStatus === "finalized"
-      ) {
-        return true;
-      }
-      await new Promise((r) => setTimeout(r, 1500));
+      await new Promise((r) => setTimeout(r, 2000));
     }
     return false;
   };
 
   const loadBalance = async (walletAddress: string) => {
     try {
-      const data = await client.getBalance(walletAddress, "SOL");
-      setBalanceSOL(data.available / 1e9);
+      const data = await client.getBalance(walletAddress, invoiceToken);
+      setPoolBalance(data.available / Math.pow(10, tokenInfo.decimals));
     } catch (err) {
-      // Balance is helpful UX, but not critical for transfer.
       console.warn("Balance load failed:", err);
     }
   };
 
-  const ensurePoolBalance = async (walletAddress: string, requiredSol: number) => {
-    // ShadowWire transfers spend from the ShadowWire pool balance, not directly from the wallet.
-    const data = await client.getBalance(walletAddress, "SOL");
-    const availableSol = data.available / 1e9;
+  const ensurePoolBalance = async (walletAddress: string, requiredAmount: number) => {
+    const data = await client.getBalance(walletAddress, invoiceToken);
+    const available = data.available / Math.pow(10, tokenInfo.decimals);
 
-    if (availableSol >= requiredSol) {
-      setBalanceSOL(availableSol);
+    if (available >= requiredAmount) {
+      setPoolBalance(available);
       return;
     }
 
-    // If user doesn't have pool balance, they must deposit (this DOES require a wallet transaction).
     if (!sendTransaction || !signTransaction) {
       throw new Error("This wallet cannot sign transactions required for deposit.");
     }
 
-    const lamportsToDeposit = Math.ceil((requiredSol - availableSol) * 1e9);
-    toast.info("Depositing to ShadowWire pool...", {
-      description: `Depositing ${(lamportsToDeposit / 1e9).toFixed(4)} SOL`,
+    const unitsToDeposit = Math.ceil((requiredAmount - available) * Math.pow(10, tokenInfo.decimals));
+    toast.info(`Depositing to ShadowWire pool...`, {
+      description: `Depositing ${(unitsToDeposit / Math.pow(10, tokenInfo.decimals)).toFixed(4)} ${invoiceToken}`,
       duration: 10000,
     });
 
     const depositResp = await client.deposit({
       wallet: walletAddress,
-      amount: lamportsToDeposit,
+      amount: unitsToDeposit,
     });
 
     const txBytes = decodeBase64ToUint8Array(depositResp.unsigned_tx_base64);
     const tx = Transaction.from(txBytes);
 
-    // Refresh blockhash for reliability.
     const { blockhash } = await connection.getLatestBlockhash("finalized");
     tx.recentBlockhash = blockhash;
     tx.feePayer = publicKey ?? tx.feePayer;
@@ -154,10 +265,7 @@ export function PaymentForm({ invoice: initialInvoice }: PaymentFormProps) {
     const depositUrl = getSolscanTxUrl(depositSig);
     toast.info("Deposit submitted", {
       description: `Tx: ${depositSig.slice(0, 8)}...${depositSig.slice(-8)}`,
-      action: {
-        label: "View on Solscan",
-        onClick: () => window.open(depositUrl, "_blank"),
-      },
+      action: { label: "View on Solscan", onClick: () => window.open(depositUrl, "_blank") },
       duration: 12000,
     });
 
@@ -166,7 +274,29 @@ export function PaymentForm({ invoice: initialInvoice }: PaymentFormProps) {
       throw new Error("Deposit submitted but not confirmed yet. Please retry in a moment.");
     }
 
-    await loadBalance(walletAddress);
+    // Wait for ShadowWire to process the deposit (balance may not update immediately)
+    toast.info("Waiting for pool balance to update...", { duration: 5000 });
+
+    // Retry balance check up to 5 times with 2 second delays
+    let newBalance = 0;
+    for (let i = 0; i < 5; i++) {
+      await new Promise(r => setTimeout(r, 2000));
+      try {
+        const data = await client.getBalance(walletAddress, invoiceToken);
+        newBalance = data.available / Math.pow(10, tokenInfo.decimals);
+        console.log(`[Deposit] Balance check ${i + 1}: ${newBalance} ${invoiceToken}`);
+        if (newBalance >= requiredAmount) {
+          setPoolBalance(newBalance);
+          return;
+        }
+      } catch (err) {
+        console.warn(`[Deposit] Balance check ${i + 1} failed:`, err);
+      }
+    }
+
+    // If we get here, balance still not enough after retries
+    setPoolBalance(newBalance);
+    throw new Error(`Deposit confirmed but pool balance (${newBalance.toFixed(4)} ${invoiceToken}) still below required (${requiredAmount} ${invoiceToken}). Please try again.`);
   };
 
   useEffect(() => {
@@ -177,7 +307,6 @@ export function PaymentForm({ invoice: initialInvoice }: PaymentFormProps) {
       }
 
       try {
-        // Vite-friendly WASM URL (same intent as '/wasm/settler_wasm_bg.wasm' in examples)
         await initWASM(wasmUrl);
         setWasmInitialized(true);
 
@@ -200,125 +329,31 @@ export function PaymentForm({ invoice: initialInvoice }: PaymentFormProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [wasmInitialized, publicKey?.toBase58()]);
 
-  const handleNormalTransfer = async (sender: string) => {
-    if (!sendTransaction) {
-      throw new Error("Wallet cannot send transactions.");
-    }
-
-    const recipientPubkey = new PublicKey(invoice.recipientAddress);
-    const lamports = Math.round(invoice.amount * LAMPORTS_PER_SOL);
-
-    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("finalized");
-    const tx = new Transaction({
-      recentBlockhash: blockhash,
-      feePayer: publicKey ?? undefined,
-    }).add(
-      SystemProgram.transfer({
-        fromPubkey: publicKey!,
-        toPubkey: recipientPubkey,
-        lamports,
-      }),
-    );
-
-    const signature = await sendTransaction(tx, connection, {
-      skipPreflight: false,
-      preflightCommitment: "confirmed",
-      maxRetries: 3,
-    });
-
-    if (!signature) {
-      throw new Error("Wallet did not return a transaction signature.");
-    }
-
-    setTransactionSignature(signature);
-    const txUrl = getSolscanTxUrl(signature);
-
-    // Store pending immediately to prevent double-pay clicks.
-    upsertInvoice({
-      ...invoice,
-      status: "pending",
-      payerAddress: sender,
-      transactionSignature: signature,
-      paymentMethod: "normal",
-      isAnonymous: false,
-    });
-
-    toast.info("Transaction submitted", {
-      description: `Tx: ${signature.slice(0, 8)}...${signature.slice(-8)}`,
-      action: {
-        label: "View on Solscan",
-        onClick: () => window.open(txUrl, "_blank"),
-      },
-      duration: 10000,
-    });
-
-    const confirmed = await connection.confirmTransaction(
-      { signature, blockhash, lastValidBlockHeight },
-      "confirmed",
-    );
-    if (confirmed.value.err) {
-      throw new Error(`Transaction failed: ${JSON.stringify(confirmed.value.err)}`);
-    }
-
-    upsertInvoice({
-      ...invoice,
-      status: "paid",
-      payerAddress: sender,
-      paidAt: new Date(),
-      transactionSignature: signature,
-      paymentMethod: "normal",
-      isAnonymous: false,
-    });
-
-    setInvoice((prev) => ({
-      ...prev,
-      status: "paid",
-      payerAddress: sender,
-      paidAt: new Date(),
-      transactionSignature: signature,
-      paymentMethod: "normal",
-      isAnonymous: false,
-    }));
-    setIsPaid(true);
-  };
-
   const handlePayment = async () => {
     if (!publicKey || !connected) {
       toast.error('Please connect your wallet first');
       return;
     }
 
-    // If we already have a submitted signature for this pending invoice, don't let user double-submit.
-    if (invoice.status === "pending" && invoice.transactionSignature) {
+    // Prevent double-submit - but only if the previous signature is valid
+    // If previous attempt had an invalid signature, allow retry
+    if (invoice.status === "pending" && invoice.transactionSignature && isValidSignature(invoice.transactionSignature)) {
       toast.info("Transaction already submitted", {
         description: `Signature: ${invoice.transactionSignature.slice(0, 8)}...${invoice.transactionSignature.slice(-8)}`,
-        action: {
-          label: "View on Solscan",
-          onClick: () => window.open(getSolscanTxUrl(invoice.transactionSignature!), "_blank"),
-        },
+        action: { label: "View on Solscan", onClick: () => window.open(getSolscanTxUrl(invoice.transactionSignature!), "_blank") },
         duration: 12000,
       });
       return;
     }
 
-    const currentCluster = getSolanaCluster();
-    setCluster(currentCluster);
-
-    // Prevent duplicate payments - check if invoice is already paid
+    // Prevent duplicate payments
     if (invoice.status === 'paid') {
-      toast.error('This invoice has already been paid', {
-        description: invoice.transactionSignature 
-          ? `Transaction: ${invoice.transactionSignature.slice(0, 8)}...${invoice.transactionSignature.slice(-8)}`
-          : 'Please check the invoice details.',
-      });
+      toast.error('This invoice has already been paid');
       return;
     }
 
-    // Check if current user already paid this invoice
     if (invoice.payerAddress === publicKey.toBase58()) {
-      toast.error('You have already paid this invoice', {
-        description: 'This invoice was already paid by your wallet address.',
-      });
+      toast.error('You have already paid this invoice');
       return;
     }
 
@@ -329,21 +364,7 @@ export function PaymentForm({ invoice: initialInvoice }: PaymentFormProps) {
       const sender = publicKey.toBase58();
       const recipient = invoice.recipientAddress;
 
-      // Make sure this invoice is present locally to reflect on dashboard.
       upsertInvoice(invoice);
-
-      if (transferMode === "normal") {
-        await handleNormalTransfer(sender);
-        return;
-      }
-
-      // ShadowWire modes require mainnet-beta.
-      if (currentCluster !== "mainnet-beta") {
-        toast.error("ShadowWire requires Solana Mainnet-Beta", {
-          description: "Switch the app + wallet network to mainnet-beta to use private/anonymous transfers.",
-        });
-        return;
-      }
 
       if (!wasmInitialized) {
         toast.error("ShadowWire not initialized", {
@@ -359,89 +380,115 @@ export function PaymentForm({ invoice: initialInvoice }: PaymentFormProps) {
         return;
       }
 
-      // Ensure funds are available in the ShadowWire pool (deposit if needed).
+      // Validate minimum amount
+      if (invoice.amount < tokenInfo.minAmount) {
+        toast.error(`Minimum amount is ${tokenInfo.minAmount} ${invoiceToken}`, {
+          description: `ShadowWire requires at least ${tokenInfo.minAmount} ${invoiceToken} per transfer.`,
+        });
+        return;
+      }
+
+      // ShadowWire deducts fee from the transfer amount (recipient gets amount - fee)
+      // So we only need to have the invoice amount in the pool
+      console.log(`[Transfer] Amount: ${invoice.amount}, Fee: ${feeInfo.fee} (deducted from amount)`);
+
+      // Ensure pool balance for the invoice amount
       await ensurePoolBalance(sender, invoice.amount);
 
-      // Attempt internal (private) transfer first, fall back to external if recipient isn't found.
-      let transferType: "internal" | "external" =
-        transferMode === "shadowwire_anonymous" ? "external" : "internal";
-      let result: any;
-      try {
-        result = await client.transfer({
-          sender,
-          recipient,
-          amount: invoice.amount,
-          token: "SOL",
-          type: transferType,
-          wallet: { signMessage: (m) => signMessage(m) },
-        });
-      } catch (err: any) {
-        if (transferType === "internal" && err instanceof RecipientNotFoundError) {
-          transferType = "external";
-          result = await client.transfer({
-            sender,
-            recipient,
-            amount: invoice.amount,
-            token: "SOL",
-            type: "external",
-            wallet: { signMessage: (m) => signMessage(m) },
-          });
-        } else {
-          throw err;
+      // Always use external transfer - funds go directly to recipient's wallet
+      // This is better UX: recipient doesn't need to withdraw from ShadowWire pool
+      const result = await client.transfer({
+        sender,
+        recipient,
+        amount: invoice.amount,
+        token: invoiceToken,
+        type: "external",
+        wallet: { signMessage: (m) => signMessage(m) },
+      });
+
+      // Log the full result for debugging
+      console.log("[Transfer] Full result from ShadowWire:", JSON.stringify(result, null, 2));
+
+      // Check if transfer was successful
+      if (!result?.success) {
+        console.error("[Transfer] ShadowWire transfer failed:", result);
+        // Try to extract more info - check multiple possible error fields
+        const errorInfo = (result as any)?.error
+          || (result as any)?.message
+          || (result as any)?.reason
+          || (result as any)?.errorMessage
+          || null;
+
+        if (errorInfo) {
+          throw new Error(`Transfer failed: ${errorInfo}`);
         }
+        // If no error info, might be insufficient balance after deposit timing issue
+        throw new Error("Transfer failed. Your pool balance may not have updated yet. Please wait a moment and try again.");
       }
 
-      const signature = (result?.tx_signature as string | undefined) ?? "";
+      let signature = (result?.tx_signature as string | undefined) ?? "";
       if (!signature) {
-        throw new Error("ShadowWire did not return a transaction signature. Transfer not completed.");
+        console.error("[Transfer] No signature in result:", result);
+        throw new Error("ShadowWire did not return a transaction signature.");
       }
+
+      // ShadowWire returns signatures with "TX1:" prefix for internal transfers
+      // Strip the prefix to get the actual Solana signature
+      if (signature.startsWith("TX1:")) {
+        console.log("[Transfer] Stripping TX1: prefix from signature");
+        signature = signature.substring(4);
+      }
+
+      // Validate the signature format before proceeding
+      if (!isValidSignature(signature)) {
+        console.error("[Transfer] Invalid signature format after processing:", signature, "Full result:", result);
+        // For internal ShadowWire transfers, the "signature" might be an internal ID
+        // In this case, we mark as paid but note we can't verify on-chain
+        console.warn("[Transfer] This may be an internal ShadowWire transfer ID, not an on-chain signature");
+        // Still allow proceeding if transfer succeeded
+      }
+
+      console.log("[Transfer] Signature to use:", signature);
 
       setTransactionSignature(signature);
-
       const txUrl = getSolscanTxUrl(signature);
 
       toast.success("Transfer submitted", {
-        description:
-          transferType === "internal"
-            ? `Private transfer • ${signature.slice(0, 8)}...${signature.slice(-8)}`
-            : `External transfer • ${signature.slice(0, 8)}...${signature.slice(-8)}`,
-        action: {
-          label: "View on Solscan",
-          onClick: () => window.open(txUrl, "_blank"),
-        },
+        description: `Anonymous transfer • ${signature.slice(0, 8)}...${signature.slice(-8)}`,
+        action: { label: "View on Solscan", onClick: () => window.open(txUrl, "_blank") },
         duration: 10000,
       });
 
-      if (transferType === "external") {
-        toast.message("Recipient not found for private transfer", {
-          description: "Sent as an external transfer (amount visible) to ensure delivery.",
-          duration: 8000,
-        });
-      }
-
-      // Store pending immediately (prevents double-pay), then confirm before marking paid.
+      // Mark pending immediately
       upsertInvoice({
         ...invoice,
         status: "pending",
         payerAddress: sender,
         transactionSignature: signature,
         paymentMethod: "shadowwire",
-        isAnonymous: transferMode === "shadowwire_anonymous",
+        isAnonymous: true, // External transfers hide sender identity
       });
 
-      const confirmed = await confirmSignature(signature, 120_000);
-      if (!confirmed) {
-        toast.warning("Waiting for confirmation", {
-          description: "Transfer submitted but not confirmed yet. Please check Solscan.",
-          action: {
-            label: "View on Solscan",
-            onClick: () => window.open(txUrl, "_blank"),
-          },
-          duration: 15000,
-        });
-        return;
+      // Only confirm on-chain if we have a valid Solana signature
+      // Internal ShadowWire transfers may use internal IDs that can't be verified on-chain
+      let confirmed = false;
+      if (isValidSignature(signature)) {
+        confirmed = await confirmSignature(signature, 120_000);
+        if (!confirmed) {
+          toast.warning("Waiting for confirmation", {
+            description: "Transfer submitted but not confirmed yet.",
+            action: { label: "View on Solscan", onClick: () => window.open(txUrl, "_blank") },
+            duration: 15000,
+          });
+          return;
+        }
+      } else {
+        // For internal transfers without on-chain signature, trust the success response
+        console.log("[Transfer] Internal transfer - trusting ShadowWire success response");
+        confirmed = true;
       }
 
+      // Mark paid
       upsertInvoice({
         ...invoice,
         status: "paid",
@@ -449,7 +496,7 @@ export function PaymentForm({ invoice: initialInvoice }: PaymentFormProps) {
         paidAt: new Date(),
         transactionSignature: signature,
         paymentMethod: "shadowwire",
-        isAnonymous: transferMode === "shadowwire_anonymous",
+        isAnonymous: true,
       });
 
       setInvoice((prev) => ({
@@ -459,7 +506,7 @@ export function PaymentForm({ invoice: initialInvoice }: PaymentFormProps) {
         paidAt: new Date(),
         transactionSignature: signature,
         paymentMethod: "shadowwire",
-        isAnonymous: transferMode === "shadowwire_anonymous",
+        isAnonymous: true,
       }));
 
       setIsPaid(true);
@@ -469,21 +516,20 @@ export function PaymentForm({ invoice: initialInvoice }: PaymentFormProps) {
       console.error("Payment error:", error);
 
       if (error instanceof RecipientNotFoundError) {
-        setShadowWireError("Recipient not found. Try external transfer.");
+        setShadowWireError("Recipient not found. Using external transfer.");
       } else if (error instanceof InsufficientBalanceError) {
-        setShadowWireError("Insufficient ShadowWire balance. Please deposit to the ShadowWire pool.");
+        setShadowWireError("Insufficient ShadowWire balance.");
       } else {
         setShadowWireError("Transfer failed: " + (error?.message ?? String(error)));
       }
 
-      toast.error("Transfer failed", {
-        description: error?.message ?? "Please try again.",
-      });
+      toast.error("Transfer failed", { description: error?.message ?? "Please try again." });
     } finally {
       setIsProcessing(false);
     }
   };
 
+  // PAID STATE
   if (isPaid || invoice.status === 'paid') {
     return (
       <motion.div
@@ -495,63 +541,66 @@ export function PaymentForm({ invoice: initialInvoice }: PaymentFormProps) {
           <CheckCircle2 className="h-10 w-10 text-green-400" />
         </div>
         <h3 className="font-mono text-2xl font-bold text-green-400 mb-2">Payment Complete</h3>
+
+        {invoice.paymentMethod && (
+          <div className="mb-4">
+            <span className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-sm font-mono ${
+              invoice.isAnonymous ? 'bg-purple-500/20 text-purple-400' : 'bg-blue-500/20 text-blue-400'
+            }`}>
+              {invoice.isAnonymous ? (
+                <><EyeOff className="h-4 w-4" /> Anonymous Payment</>
+              ) : (
+                <><Shield className="h-4 w-4" /> Private Payment</>
+              )}
+            </span>
+          </div>
+        )}
+
         <p className="text-muted-foreground mb-4">
-          This invoice has been paid successfully.
+          {invoice.isAnonymous
+            ? 'Paid anonymously via ShadowWire. Your identity is protected.'
+            : 'Paid privately via ShadowWire with hidden transaction amount.'}
         </p>
-        
-        {invoice.payerAddress && (
+
+        {invoice.payerAddress && !invoice.isAnonymous && (
           <p className="text-sm text-muted-foreground mb-2 font-mono">
             Paid by: {invoice.payerAddress.slice(0, 8)}...{invoice.payerAddress.slice(-6)}
           </p>
         )}
-        
+
         {explorerUrl && (
-          <a
-            href={explorerUrl}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="inline-flex items-center gap-2 text-sm text-primary hover:underline font-mono mt-4"
-          >
-            View transaction on Solscan
-            <ExternalLink className="h-4 w-4" />
+          <a href={explorerUrl} target="_blank" rel="noopener noreferrer"
+            className="inline-flex items-center gap-2 text-sm text-primary hover:underline font-mono mt-4">
+            View transaction on Solscan <ExternalLink className="h-4 w-4" />
           </a>
         )}
       </motion.div>
     );
   }
 
+  // EXPIRED STATE
   if (invoice.status === 'expired') {
     return (
-      <motion.div
-        initial={{ opacity: 0, scale: 0.95 }}
-        animate={{ opacity: 1, scale: 1 }}
-        className="glass-card p-8 text-center"
-      >
+      <motion.div initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} className="glass-card p-8 text-center">
         <div className="w-20 h-20 rounded-full bg-destructive/20 flex items-center justify-center mx-auto mb-6">
           <AlertCircle className="h-10 w-10 text-destructive" />
         </div>
         <h3 className="font-mono text-2xl font-bold text-destructive mb-2">Invoice Expired</h3>
-        <p className="text-muted-foreground">
-          This invoice is no longer valid.
-        </p>
+        <p className="text-muted-foreground">This invoice is no longer valid.</p>
       </motion.div>
     );
   }
 
+  // PAYMENT FORM
   return (
-    <motion.div
-      initial={{ opacity: 0, y: 20 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.5 }}
-      className="glass-card-glow p-8"
-    >
+    <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.5 }} className="glass-card-glow p-8">
       <div className="flex items-center gap-3 mb-6">
         <div className="w-12 h-12 rounded-lg bg-primary/10 flex items-center justify-center">
           <Wallet className="h-6 w-6 text-primary" />
         </div>
         <div>
           <h2 className="font-mono text-xl font-bold">Pay Invoice</h2>
-          <p className="text-sm text-muted-foreground">Send SOL to complete payment</p>
+          <p className="text-sm text-muted-foreground">Private payment via ShadowWire</p>
         </div>
       </div>
 
@@ -559,7 +608,7 @@ export function PaymentForm({ invoice: initialInvoice }: PaymentFormProps) {
         <div className="p-4 rounded-lg bg-secondary/30 border border-border/50">
           <p className="text-sm text-muted-foreground font-mono mb-1">Amount to pay</p>
           <p className="text-3xl font-bold font-mono text-gradient">
-            {invoice.amount} <span className="text-lg">SOL</span>
+            {invoice.amount} <span className="text-lg">{invoiceToken}</span>
           </p>
         </div>
 
@@ -572,21 +621,30 @@ export function PaymentForm({ invoice: initialInvoice }: PaymentFormProps) {
 
         <div className="p-4 rounded-lg bg-secondary/30 border border-border/50">
           <p className="text-sm text-muted-foreground font-mono mb-1">Sending to</p>
-          <p className="font-mono text-sm truncate text-foreground/80">
-            {invoice.recipientAddress}
-          </p>
+          <p className="font-mono text-sm truncate text-foreground/80">{invoice.recipientAddress}</p>
         </div>
+
+        {/* Auto-verification indicator - shows for anyone viewing pending invoice */}
+        {invoice.status === 'pending' && (
+          <div className="p-3 rounded-lg bg-blue-500/10 border border-blue-500/20">
+            <div className="flex items-center gap-2">
+              <RefreshCw className={`h-4 w-4 text-blue-400 ${isVerifyingPayment ? 'animate-spin' : ''}`} />
+              <p className="text-sm font-mono text-blue-400">
+                {isVerifyingPayment ? 'Checking for payment...' : 'Monitoring for incoming payment'}
+              </p>
+            </div>
+            <p className="text-xs text-muted-foreground mt-1">
+              This page will automatically update when payment is received.
+            </p>
+          </div>
+        )}
       </div>
 
       {!wasmInitialized && !shadowWireError ? (
-        <div className="space-y-4">
-          <div className="p-6 rounded-lg bg-primary/10 border border-primary/20 text-center">
-            <Loader2 className="h-8 w-8 animate-spin text-primary mx-auto mb-4" />
-            <h3 className="font-mono text-lg font-bold mb-2">Initializing ShadowWire...</h3>
-            <p className="text-sm text-muted-foreground">
-              Preparing zero-knowledge proof system in your browser.
-            </p>
-          </div>
+        <div className="p-6 rounded-lg bg-primary/10 border border-primary/20 text-center">
+          <Loader2 className="h-8 w-8 animate-spin text-primary mx-auto mb-4" />
+          <h3 className="font-mono text-lg font-bold mb-2">Initializing ShadowWire...</h3>
+          <p className="text-sm text-muted-foreground">Preparing zero-knowledge proof system.</p>
         </div>
       ) : !connected ? (
         <div className="text-center">
@@ -595,73 +653,58 @@ export function PaymentForm({ invoice: initialInvoice }: PaymentFormProps) {
         </div>
       ) : (
         <div className="space-y-4">
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-            <div className="p-3 rounded-lg bg-secondary/30 border border-border/50">
-              <p className="text-xs text-muted-foreground font-mono mb-2">Transfer</p>
-              <div className="flex flex-wrap gap-2">
-                <Button
-                  type="button"
-                  size="sm"
-                  variant={transferMode === "normal" ? "glow" : "glass"}
-                  onClick={() => setTransferMode("normal")}
-                  disabled={isProcessing}
-                >
-                  Normal
-                </Button>
-                <Button
-                  type="button"
-                  size="sm"
-                  variant={transferMode === "shadowwire_private" ? "glow" : "glass"}
-                  onClick={() => setTransferMode("shadowwire_private")}
-                  disabled={isProcessing}
-                >
-                  Private
-                </Button>
-                <Button
-                  type="button"
-                  size="sm"
-                  variant={transferMode === "shadowwire_anonymous" ? "glow" : "glass"}
-                  onClick={() => setTransferMode("shadowwire_anonymous")}
-                  disabled={isProcessing}
-                >
-                  Anonymous
-                </Button>
-              </div>
+          {/* Anonymous Transfer Info */}
+          <div className="p-3 rounded-lg bg-primary/10 border border-primary/20">
+            <div className="flex items-center gap-2 mb-1">
+              <EyeOff className="h-4 w-4 text-primary" />
+              <p className="text-sm font-mono font-medium text-primary">Anonymous Payment</p>
             </div>
-
-            <div className="p-3 rounded-lg bg-secondary/30 border border-border/50">
-              <p className="text-xs text-muted-foreground font-mono mb-2">Network</p>
-              <div className="flex gap-2">
-                <Button
-                  type="button"
-                  size="sm"
-                  variant={cluster === "devnet" ? "glow" : "glass"}
-                  onClick={() => switchNetwork("devnet")}
-                  disabled={isProcessing}
-                >
-                  Devnet
-                </Button>
-                <Button
-                  type="button"
-                  size="sm"
-                  variant={cluster === "mainnet-beta" ? "glow" : "glass"}
-                  onClick={() => switchNetwork("mainnet-beta")}
-                  disabled={isProcessing}
-                >
-                  Mainnet
-                </Button>
-              </div>
-            </div>
+            <p className="text-xs text-muted-foreground">
+              Your identity is hidden. Funds go directly to recipient's wallet.
+            </p>
           </div>
 
-          {transferMode !== "normal" && balanceSOL !== null && (
-            <div className="p-3 rounded-lg bg-secondary/30 border border-border/50 text-center">
-              <p className="text-xs text-muted-foreground font-mono">ShadowWire Balance</p>
-              <p className="font-mono text-sm">
-                Available: <span className="text-foreground">{balanceSOL.toFixed(4)} SOL</span>
+          {/* ShadowWire Balance & Fee Info */}
+          <div className="p-3 rounded-lg bg-secondary/30 border border-border/50">
+            <div className="grid grid-cols-2 gap-4 text-center">
+              <div>
+                <p className="text-xs text-muted-foreground font-mono">ShadowWire Balance</p>
+                <p className={`font-mono text-sm ${(poolBalance ?? 0) === 0 ? 'text-yellow-400' : 'text-foreground'}`}>
+                  {poolBalance?.toFixed(4) ?? "0.0000"} {invoiceToken}
+                </p>
+              </div>
+              <div>
+                <p className="text-xs text-muted-foreground font-mono">Fee ({feeInfo.feePercent}%)</p>
+                <p className="font-mono text-sm text-foreground">{feeInfo.fee.toFixed(4)} {invoiceToken}</p>
+              </div>
+            </div>
+
+            {(poolBalance ?? 0) < invoice.amount && (
+              <div className="mt-2 p-2 rounded bg-yellow-500/10 border border-yellow-500/20">
+                <p className="text-xs text-yellow-400 font-mono text-center mb-1">
+                  <AlertCircle className="h-3 w-3 inline mr-1" /> Deposit Required
+                </p>
+                <p className="text-xs text-muted-foreground text-center">
+                  Auto-deposits to ShadowWire pool when you click Pay.
+                </p>
+              </div>
+            )}
+
+            {feeInfo.isBelowMin && (
+              <div className="mt-2 p-2 rounded bg-destructive/10 border border-destructive/20">
+                <p className="text-xs text-destructive font-mono text-center">
+                  <AlertCircle className="h-3 w-3 inline mr-1" /> Minimum: {feeInfo.minAmount} {invoiceToken}
+                </p>
+              </div>
+            )}
+
+            <div className="mt-2 p-2 rounded bg-primary/5 border border-primary/10">
+              <p className="text-xs text-muted-foreground text-center">
+                <Info className="h-3 w-3 inline mr-1" />
+                Min {tokenInfo.minAmount} {invoiceToken} • {tokenInfo.feePercent}% fee • Solana Mainnet
               </p>
             </div>
-          )}
+          </div>
 
           {shadowWireError && (
             <div className="p-3 rounded-lg bg-destructive/10 border border-destructive/20">
@@ -669,33 +712,20 @@ export function PaymentForm({ invoice: initialInvoice }: PaymentFormProps) {
             </div>
           )}
 
-          <Button
-            variant="glow"
-            size="lg"
-            className="w-full group"
-            onClick={handlePayment}
-            disabled={isProcessing || (transferMode !== "normal" && !wasmInitialized)}
-          >
-          {isProcessing ? (
-            <>
-              <Loader2 className="h-4 w-4 animate-spin" />
-              Sending...
-            </>
-          ) : (
-            <>
-              Pay {invoice.amount} SOL
-              <ArrowRight className="h-4 w-4 transition-transform group-hover:translate-x-1" />
-            </>
-          )}
+          <Button variant="glow" size="lg" className="w-full group" onClick={handlePayment}
+            disabled={isProcessing || !wasmInitialized || feeInfo.isBelowMin}>
+            {isProcessing ? (
+              <><Loader2 className="h-4 w-4 animate-spin" /> Processing...</>
+            ) : (
+              <>Pay {invoice.amount} {invoiceToken} <ArrowRight className="h-4 w-4 transition-transform group-hover:translate-x-1" /></>
+            )}
           </Button>
         </div>
       )}
 
-      <div className="mt-4 space-y-2">
+      <div className="mt-4">
         <p className="text-xs text-muted-foreground text-center">
-          {transferMode === "normal"
-            ? `Normal transfer on Solana ${cluster}`
-            : "ShadowWire transfer on Solana Mainnet-Beta"}
+          ShadowWire private transfer on Solana Mainnet
         </p>
       </div>
     </motion.div>
