@@ -4,43 +4,45 @@ import { motion } from 'framer-motion';
 import { Link } from 'react-router-dom';
 import { Header } from '@/components/Header';
 import { InvoiceList } from '@/components/InvoiceList';
-import { useInvoices } from '@/contexts/InvoiceContext';
+import { ShadowWirePool } from '@/components/ShadowWirePool';
+import { useInvoices, InvoiceToken } from '@/contexts/InvoiceContext';
 import { Button } from '@/components/ui/button';
-import { Wallet, Plus, FileText, CheckCircle2, Clock, ArrowUpRight, ArrowDownRight } from 'lucide-react';
+import { Wallet, Plus, FileText, Clock, ArrowUpRight, ArrowDownRight, Shield } from 'lucide-react';
 
 const Dashboard = () => {
   const { connected, publicKey } = useWallet();
   const { invoices } = useInvoices();
 
   // Invoices where current user is the recipient (payments received)
-  const receivedInvoices = connected && publicKey 
+  const receivedInvoices = connected && publicKey
     ? invoices.filter(inv => inv.recipientAddress === publicKey.toBase58())
     : [];
 
   // Invoices where current user is the payer (payments made)
-  const paidInvoices = connected && publicKey 
+  const paidInvoices = connected && publicKey
     ? invoices.filter(inv => inv.payerAddress === publicKey.toBase58() && inv.status === 'paid')
     : [];
-
-  // Debug logging
-  console.log('Dashboard - Total invoices:', invoices.length);
-  console.log('Dashboard - Received invoices:', receivedInvoices);
-  console.log('Dashboard - Paid invoices:', paidInvoices);
 
   // Stats for received invoices
   const pendingCount = receivedInvoices.filter(inv => inv.status === 'pending').length;
   const paidReceivedCount = receivedInvoices.filter(inv => inv.status === 'paid').length;
-  const totalReceived = receivedInvoices
-    .filter(inv => inv.status === 'paid')
-    .reduce((sum, inv) => sum + inv.amount, 0);
 
-  // Stats for payments made
-  const totalPaid = paidInvoices.reduce((sum, inv) => sum + inv.amount, 0);
+  // Calculate totals by token
+  const calculateTotalByToken = (invs: typeof invoices, token: InvoiceToken) => {
+    return invs
+      .filter(inv => inv.status === 'paid' && (inv.token || 'SOL') === token)
+      .reduce((sum, inv) => sum + Number(inv.amount), 0);
+  };
+
+  const receivedSOL = calculateTotalByToken(receivedInvoices, 'SOL');
+  const receivedUSD1 = calculateTotalByToken(receivedInvoices, 'USD1');
+  const paidSOL = calculateTotalByToken(paidInvoices, 'SOL');
+  const paidUSD1 = calculateTotalByToken(paidInvoices, 'USD1');
 
   return (
     <div className="min-h-screen bg-background">
       <Header />
-      
+
       <main className="container mx-auto px-4 pt-24 pb-12">
         <motion.div
           initial={{ opacity: 0, y: 20 }}
@@ -52,11 +54,12 @@ const Dashboard = () => {
               <h1 className="font-mono text-3xl md:text-4xl font-bold mb-2">
                 <span className="text-gradient">Dashboard</span>
               </h1>
-              <p className="text-muted-foreground">
-                Manage your invoices and track payments
+              <p className="text-muted-foreground flex items-center gap-2">
+                <Shield className="h-4 w-4" />
+                Privacy-first invoices on Solana Mainnet
               </p>
             </div>
-            
+
             {connected && (
               <Link to="/create">
                 <Button variant="glow" className="gap-2">
@@ -69,6 +72,9 @@ const Dashboard = () => {
 
           {connected ? (
             <>
+              {/* ShadowWire Pool - Withdraw funds */}
+              <ShadowWirePool />
+
               {/* Stats */}
               <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
                 <motion.div
@@ -107,9 +113,21 @@ const Dashboard = () => {
                     <ArrowDownRight className="h-5 w-5 text-green-400" />
                     <span className="text-sm text-muted-foreground font-mono">Received</span>
                   </div>
-                  <p className="text-3xl font-bold font-mono text-green-400">
-                    {totalReceived.toFixed(2)} <span className="text-lg">SOL</span>
-                  </p>
+                  <div className="space-y-1">
+                    {receivedSOL > 0 && (
+                      <p className="text-2xl font-bold font-mono text-green-400">
+                        {receivedSOL.toFixed(2)} <span className="text-sm">SOL</span>
+                      </p>
+                    )}
+                    {receivedUSD1 > 0 && (
+                      <p className="text-2xl font-bold font-mono text-green-400">
+                        {receivedUSD1.toFixed(2)} <span className="text-sm">USD1</span>
+                      </p>
+                    )}
+                    {receivedSOL === 0 && receivedUSD1 === 0 && (
+                      <p className="text-2xl font-bold font-mono text-green-400">0.00</p>
+                    )}
+                  </div>
                 </motion.div>
 
                 <motion.div
@@ -122,9 +140,21 @@ const Dashboard = () => {
                     <ArrowUpRight className="h-5 w-5 text-blue-400" />
                     <span className="text-sm text-muted-foreground font-mono">Paid</span>
                   </div>
-                  <p className="text-3xl font-bold font-mono text-blue-400">
-                    {totalPaid.toFixed(2)} <span className="text-lg">SOL</span>
-                  </p>
+                  <div className="space-y-1">
+                    {paidSOL > 0 && (
+                      <p className="text-2xl font-bold font-mono text-blue-400">
+                        {paidSOL.toFixed(2)} <span className="text-sm">SOL</span>
+                      </p>
+                    )}
+                    {paidUSD1 > 0 && (
+                      <p className="text-2xl font-bold font-mono text-blue-400">
+                        {paidUSD1.toFixed(2)} <span className="text-sm">USD1</span>
+                      </p>
+                    )}
+                    {paidSOL === 0 && paidUSD1 === 0 && (
+                      <p className="text-2xl font-bold font-mono text-blue-400">0.00</p>
+                    )}
+                  </div>
                 </motion.div>
               </div>
 
@@ -174,7 +204,7 @@ const Dashboard = () => {
               </div>
               <h2 className="font-mono text-xl font-bold mb-3">Connect Your Wallet</h2>
               <p className="text-muted-foreground mb-6">
-                Connect your Solana wallet to view your invoices and track payments.
+                Connect your Solana wallet to create private invoices and track payments.
               </p>
               <WalletMultiButton className="!bg-primary !text-primary-foreground !font-mono !rounded-lg !h-12 !px-8 hover:!shadow-[0_0_20px_hsl(var(--primary)/0.4)] !transition-all !mx-auto" />
             </motion.div>
