@@ -12,6 +12,9 @@ export interface Invoice {
   paidAt?: Date;
   expiresAt?: Date;
   transactionSignature?: string; // Transaction signature for tracking payments
+  // Optional payment UX flags
+  isAnonymous?: boolean; // If true, hide payer in UI for recipient-side displays
+  paymentMethod?: 'normal' | 'shadowwire';
 }
 
 interface InvoiceContextType {
@@ -19,6 +22,7 @@ interface InvoiceContextType {
   createInvoice: (amount: number, description: string, recipientAddress: string) => Invoice;
   getInvoice: (id: string) => Invoice | undefined;
   updateInvoiceStatus: (id: string, status: Invoice['status'], payerAddress?: string, transactionSignature?: string) => void;
+  upsertInvoice: (invoice: Invoice) => void;
   ensureInvoice: (invoice: Invoice) => Invoice; // Ensure invoice exists in context
 }
 
@@ -104,6 +108,38 @@ export function InvoiceProvider({ children }: { children: ReactNode }) {
     });
   };
 
+  // Upsert (create or merge) an invoice atomically in state (prevents "not found" race conditions).
+  const upsertInvoice = (invoice: Invoice) => {
+    setInvoices(prev => {
+      const existingIndex = prev.findIndex(inv => inv.id === invoice.id);
+
+      // Create
+      if (existingIndex === -1) {
+        return [invoice, ...prev];
+      }
+
+      const existing = prev[existingIndex];
+
+      // CRITICAL: Never overwrite a paid invoice with a pending one
+      if (existing.status === 'paid' && invoice.status === 'pending') {
+        return prev;
+      }
+
+      const merged: Invoice = {
+        ...existing,
+        ...invoice,
+        status: existing.status === 'paid' ? 'paid' : invoice.status,
+        transactionSignature: existing.transactionSignature || invoice.transactionSignature,
+        payerAddress: existing.payerAddress || invoice.payerAddress,
+        paidAt: existing.paidAt || invoice.paidAt,
+      };
+
+      const updated = [...prev];
+      updated[existingIndex] = merged;
+      return updated;
+    });
+  };
+
   // Ensure invoice exists in context - creates it if it doesn't exist
   const ensureInvoice = (invoice: Invoice): Invoice => {
     console.log('Ensuring invoice exists in context:', invoice);
@@ -154,7 +190,7 @@ export function InvoiceProvider({ children }: { children: ReactNode }) {
   };
 
   return (
-    <InvoiceContext.Provider value={{ invoices, createInvoice, getInvoice, updateInvoiceStatus, ensureInvoice }}>
+    <InvoiceContext.Provider value={{ invoices, createInvoice, getInvoice, updateInvoiceStatus, upsertInvoice, ensureInvoice }}>
       {children}
     </InvoiceContext.Provider>
   );
