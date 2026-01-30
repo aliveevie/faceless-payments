@@ -1,26 +1,35 @@
-import { useState, useEffect } from 'react';
-import { useWallet, useConnection } from '@solana/wallet-adapter-react';
-import { WalletMultiButton } from '@solana/wallet-adapter-react-ui';
-import { 
-  PublicKey, 
-  Transaction, 
-  SystemProgram, 
-  LAMPORTS_PER_SOL 
-} from '@solana/web3.js';
-import { motion } from 'framer-motion';
-import { Button } from './ui/button';
-import { Invoice, useInvoices } from '@/contexts/InvoiceContext';
-import { Wallet, ArrowRight, Loader2, CheckCircle2, AlertCircle, ExternalLink } from 'lucide-react';
-import { toast } from 'sonner';
+import { useEffect, useMemo, useState } from "react";
+import { useConnection, useWallet } from "@solana/wallet-adapter-react";
+import { WalletMultiButton } from "@solana/wallet-adapter-react-ui";
+import { LAMPORTS_PER_SOL, PublicKey, SystemProgram, Transaction } from "@solana/web3.js";
+import { motion } from "framer-motion";
+import { ArrowRight, AlertCircle, CheckCircle2, ExternalLink, Loader2, Wallet } from "lucide-react";
+import { toast } from "sonner";
+
+import { Invoice, useInvoices } from "@/contexts/InvoiceContext";
+import { Button } from "./ui/button";
+import { getSolanaCluster, getSolscanTxUrl, setSolanaCluster } from "@/lib/solana";
+
+// ShadowWire (aligned with `ShadowWire/examples/react-example.tsx`)
+import wasmUrl from "@radr/shadowwire/wasm/settler_wasm_bg.wasm?url";
+import {
+  ShadowWireClient,
+  initWASM,
+  isWASMSupported,
+  InsufficientBalanceError,
+  RecipientNotFoundError,
+} from "@radr/shadowwire";
 
 interface PaymentFormProps {
   invoice: Invoice;
 }
 
+type TransferMode = "normal" | "shadowwire_private" | "shadowwire_anonymous";
+
 export function PaymentForm({ invoice: initialInvoice }: PaymentFormProps) {
-  const { publicKey, sendTransaction, connected } = useWallet();
+  const { publicKey, connected, signMessage, signTransaction, sendTransaction } = useWallet();
   const { connection } = useConnection();
-  const { updateInvoiceStatus, getInvoice, invoices, ensureInvoice } = useInvoices();
+  const { upsertInvoice, invoices } = useInvoices();
   
   // Get the latest invoice from context to keep it in sync
   const [invoice, setInvoice] = useState<Invoice>(initialInvoice);
@@ -38,21 +47,262 @@ export function PaymentForm({ invoice: initialInvoice }: PaymentFormProps) {
     }
   }, [invoices, initialInvoice.id]);
   
+  const [client] = useState(() => new ShadowWireClient());
+  const [wasmInitialized, setWasmInitialized] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
-  const [isConfirming, setIsConfirming] = useState(false);
   const [isPaid, setIsPaid] = useState(invoice.status === 'paid');
   const [transactionSignature, setTransactionSignature] = useState<string | null>(null);
+  const [balanceSOL, setBalanceSOL] = useState<number | null>(null);
+  const [shadowWireError, setShadowWireError] = useState<string | null>(null);
+  const [transferMode, setTransferMode] = useState<TransferMode>("normal");
+  const [cluster, setCluster] = useState(getSolanaCluster());
+
+  const explorerUrl = useMemo(() => {
+    const sig = transactionSignature || invoice.transactionSignature;
+    return sig ? getSolscanTxUrl(sig) : null;
+  }, [transactionSignature, invoice.transactionSignature]);
   
   // Update isPaid when invoice status changes
   useEffect(() => {
     setIsPaid(invoice.status === 'paid');
   }, [invoice.status]);
 
+  const switchNetwork = (next: typeof cluster) => {
+    setSolanaCluster(next);
+    // Wallet adapter connection endpoint is configured at provider init.
+    // Reload is the most reliable way to rewire the connection.
+    window.location.reload();
+  };
+
+  const decodeBase64ToUint8Array = (b64: string): Uint8Array => {
+    const binStr = globalThis.atob(b64);
+    const bytes = new Uint8Array(binStr.length);
+    for (let i = 0; i < binStr.length; i++) {
+      bytes[i] = binStr.charCodeAt(i);
+    }
+    return bytes;
+  };
+
+  const confirmSignature = async (signature: string, timeoutMs: number = 60_000): Promise<boolean> => {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      const status = await connection.getSignatureStatus(signature, { searchTransactionHistory: true });
+      if (status.value?.err) {
+        throw new Error(`Transaction failed: ${JSON.stringify(status.value.err)}`);
+      }
+      if (
+        status.value?.confirmationStatus === "confirmed" ||
+        status.value?.confirmationStatus === "finalized"
+      ) {
+        return true;
+      }
+      await new Promise((r) => setTimeout(r, 1500));
+    }
+    return false;
+  };
+
+  const loadBalance = async (walletAddress: string) => {
+    try {
+      const data = await client.getBalance(walletAddress, "SOL");
+      setBalanceSOL(data.available / 1e9);
+    } catch (err) {
+      // Balance is helpful UX, but not critical for transfer.
+      console.warn("Balance load failed:", err);
+    }
+  };
+
+  const ensurePoolBalance = async (walletAddress: string, requiredSol: number) => {
+    // ShadowWire transfers spend from the ShadowWire pool balance, not directly from the wallet.
+    const data = await client.getBalance(walletAddress, "SOL");
+    const availableSol = data.available / 1e9;
+
+    if (availableSol >= requiredSol) {
+      setBalanceSOL(availableSol);
+      return;
+    }
+
+    // If user doesn't have pool balance, they must deposit (this DOES require a wallet transaction).
+    if (!sendTransaction || !signTransaction) {
+      throw new Error("This wallet cannot sign transactions required for deposit.");
+    }
+
+    const lamportsToDeposit = Math.ceil((requiredSol - availableSol) * 1e9);
+    toast.info("Depositing to ShadowWire pool...", {
+      description: `Depositing ${(lamportsToDeposit / 1e9).toFixed(4)} SOL`,
+      duration: 10000,
+    });
+
+    const depositResp = await client.deposit({
+      wallet: walletAddress,
+      amount: lamportsToDeposit,
+    });
+
+    const txBytes = decodeBase64ToUint8Array(depositResp.unsigned_tx_base64);
+    const tx = Transaction.from(txBytes);
+
+    // Refresh blockhash for reliability.
+    const { blockhash } = await connection.getLatestBlockhash("finalized");
+    tx.recentBlockhash = blockhash;
+    tx.feePayer = publicKey ?? tx.feePayer;
+
+    const depositSig = await sendTransaction(tx, connection, {
+      skipPreflight: false,
+      preflightCommitment: "confirmed",
+      maxRetries: 3,
+    });
+
+    const depositUrl = getSolscanTxUrl(depositSig);
+    toast.info("Deposit submitted", {
+      description: `Tx: ${depositSig.slice(0, 8)}...${depositSig.slice(-8)}`,
+      action: {
+        label: "View on Solscan",
+        onClick: () => window.open(depositUrl, "_blank"),
+      },
+      duration: 12000,
+    });
+
+    const confirmed = await confirmSignature(depositSig, 90_000);
+    if (!confirmed) {
+      throw new Error("Deposit submitted but not confirmed yet. Please retry in a moment.");
+    }
+
+    await loadBalance(walletAddress);
+  };
+
+  useEffect(() => {
+    async function init() {
+      if (!isWASMSupported()) {
+        setShadowWireError("WebAssembly not supported");
+        return;
+      }
+
+      try {
+        // Vite-friendly WASM URL (same intent as '/wasm/settler_wasm_bg.wasm' in examples)
+        await initWASM(wasmUrl);
+        setWasmInitialized(true);
+
+        if (publicKey) {
+          await loadBalance(publicKey.toBase58());
+        }
+      } catch (err: any) {
+        setShadowWireError("Initialization failed: " + (err?.message ?? String(err)));
+      }
+    }
+
+    init();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    if (!wasmInitialized) return;
+    if (!publicKey) return;
+    loadBalance(publicKey.toBase58());
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [wasmInitialized, publicKey?.toBase58()]);
+
+  const handleNormalTransfer = async (sender: string) => {
+    if (!sendTransaction) {
+      throw new Error("Wallet cannot send transactions.");
+    }
+
+    const recipientPubkey = new PublicKey(invoice.recipientAddress);
+    const lamports = Math.round(invoice.amount * LAMPORTS_PER_SOL);
+
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("finalized");
+    const tx = new Transaction({
+      recentBlockhash: blockhash,
+      feePayer: publicKey ?? undefined,
+    }).add(
+      SystemProgram.transfer({
+        fromPubkey: publicKey!,
+        toPubkey: recipientPubkey,
+        lamports,
+      }),
+    );
+
+    const signature = await sendTransaction(tx, connection, {
+      skipPreflight: false,
+      preflightCommitment: "confirmed",
+      maxRetries: 3,
+    });
+
+    if (!signature) {
+      throw new Error("Wallet did not return a transaction signature.");
+    }
+
+    setTransactionSignature(signature);
+    const txUrl = getSolscanTxUrl(signature);
+
+    // Store pending immediately to prevent double-pay clicks.
+    upsertInvoice({
+      ...invoice,
+      status: "pending",
+      payerAddress: sender,
+      transactionSignature: signature,
+      paymentMethod: "normal",
+      isAnonymous: false,
+    });
+
+    toast.info("Transaction submitted", {
+      description: `Tx: ${signature.slice(0, 8)}...${signature.slice(-8)}`,
+      action: {
+        label: "View on Solscan",
+        onClick: () => window.open(txUrl, "_blank"),
+      },
+      duration: 10000,
+    });
+
+    const confirmed = await connection.confirmTransaction(
+      { signature, blockhash, lastValidBlockHeight },
+      "confirmed",
+    );
+    if (confirmed.value.err) {
+      throw new Error(`Transaction failed: ${JSON.stringify(confirmed.value.err)}`);
+    }
+
+    upsertInvoice({
+      ...invoice,
+      status: "paid",
+      payerAddress: sender,
+      paidAt: new Date(),
+      transactionSignature: signature,
+      paymentMethod: "normal",
+      isAnonymous: false,
+    });
+
+    setInvoice((prev) => ({
+      ...prev,
+      status: "paid",
+      payerAddress: sender,
+      paidAt: new Date(),
+      transactionSignature: signature,
+      paymentMethod: "normal",
+      isAnonymous: false,
+    }));
+    setIsPaid(true);
+  };
+
   const handlePayment = async () => {
     if (!publicKey || !connected) {
       toast.error('Please connect your wallet first');
       return;
     }
+
+    // If we already have a submitted signature for this pending invoice, don't let user double-submit.
+    if (invoice.status === "pending" && invoice.transactionSignature) {
+      toast.info("Transaction already submitted", {
+        description: `Signature: ${invoice.transactionSignature.slice(0, 8)}...${invoice.transactionSignature.slice(-8)}`,
+        action: {
+          label: "View on Solscan",
+          onClick: () => window.open(getSolscanTxUrl(invoice.transactionSignature!), "_blank"),
+        },
+        duration: 12000,
+      });
+      return;
+    }
+
+    const currentCluster = getSolanaCluster();
+    setCluster(currentCluster);
 
     // Prevent duplicate payments - check if invoice is already paid
     if (invoice.status === 'paid') {
@@ -73,363 +323,161 @@ export function PaymentForm({ invoice: initialInvoice }: PaymentFormProps) {
     }
 
     setIsProcessing(true);
+    setShadowWireError(null);
 
     try {
-      const recipientPubkey = new PublicKey(invoice.recipientAddress);
-      const lamports = Math.round(invoice.amount * LAMPORTS_PER_SOL);
+      const sender = publicKey.toBase58();
+      const recipient = invoice.recipientAddress;
 
-      // Check sender balance before creating transaction
-      const senderBalance = await connection.getBalance(publicKey, 'confirmed');
-      const requiredBalance = lamports + 5000; // Amount + estimated fee (5000 lamports)
-      
-      if (senderBalance < requiredBalance) {
-        throw new Error('Insufficient funds. You need enough SOL to cover the transfer amount plus transaction fees.');
+      // Make sure this invoice is present locally to reflect on dashboard.
+      upsertInvoice(invoice);
+
+      if (transferMode === "normal") {
+        await handleNormalTransfer(sender);
+        return;
       }
 
-      // Get fresh blockhash - CRITICAL: Get this right before sending
-      const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('finalized');
-      
-      // Create transaction with fresh blockhash
-      const transaction = new Transaction({
-        recentBlockhash: blockhash,
-        feePayer: publicKey,
-      }).add(
-        SystemProgram.transfer({
-          fromPubkey: publicKey,
-          toPubkey: recipientPubkey,
-          lamports,
-        })
-      );
-
-      console.log('Sending transaction with blockhash:', blockhash);
-      
-      // Send transaction - wallet adapter handles signing and broadcasting
-      let signature: string;
-      try {
-        signature = await sendTransaction(transaction, connection, {
-          skipPreflight: false,
-          preflightCommitment: 'confirmed',
-          maxRetries: 3, // Allow retries for better reliability
+      // ShadowWire modes require mainnet-beta.
+      if (currentCluster !== "mainnet-beta") {
+        toast.error("ShadowWire requires Solana Mainnet-Beta", {
+          description: "Switch the app + wallet network to mainnet-beta to use private/anonymous transfers.",
         });
-        console.log('Transaction signature received:', signature);
-      } catch (sendError: any) {
-        console.error('Error sending transaction:', sendError);
-        
-        // Check for network errors
-        const errorMessage = sendError?.message || String(sendError);
-        if (errorMessage.includes('Network') || 
-            errorMessage.includes('fetch') || 
-            errorMessage.includes('Failed to fetch') ||
-            errorMessage.includes('network') ||
-            errorMessage.includes('ECONNREFUSED') ||
-            errorMessage.includes('timeout')) {
-          throw new Error('Network error: Unable to connect to Solana network. Please check your internet connection and try again.');
-        }
-        
-        // Re-throw other errors
-        throw sendError;
+        return;
       }
-      
-      // Set signature and show confirming state immediately
-      // sendTransaction from wallet adapter only returns signature if transaction was sent
+
+      if (!wasmInitialized) {
+        toast.error("ShadowWire not initialized", {
+          description: shadowWireError ?? "Please refresh and try again.",
+        });
+        return;
+      }
+
+      if (!signMessage) {
+        toast.error("Wallet does not support message signing", {
+          description: "ShadowWire requires a wallet that can sign messages (e.g., Phantom, Solflare).",
+        });
+        return;
+      }
+
+      // Ensure funds are available in the ShadowWire pool (deposit if needed).
+      await ensurePoolBalance(sender, invoice.amount);
+
+      // Attempt internal (private) transfer first, fall back to external if recipient isn't found.
+      let transferType: "internal" | "external" =
+        transferMode === "shadowwire_anonymous" ? "external" : "internal";
+      let result: any;
+      try {
+        result = await client.transfer({
+          sender,
+          recipient,
+          amount: invoice.amount,
+          token: "SOL",
+          type: transferType,
+          wallet: { signMessage: (m) => signMessage(m) },
+        });
+      } catch (err: any) {
+        if (transferType === "internal" && err instanceof RecipientNotFoundError) {
+          transferType = "external";
+          result = await client.transfer({
+            sender,
+            recipient,
+            amount: invoice.amount,
+            token: "SOL",
+            type: "external",
+            wallet: { signMessage: (m) => signMessage(m) },
+          });
+        } else {
+          throw err;
+        }
+      }
+
+      const signature = (result?.tx_signature as string | undefined) ?? "";
+      if (!signature) {
+        throw new Error("ShadowWire did not return a transaction signature. Transfer not completed.");
+      }
+
       setTransactionSignature(signature);
-      setIsProcessing(false);
-      setIsConfirming(true);
-      
-      // Try to verify transaction exists (non-blocking, for logging purposes)
-      // Don't throw errors here - just log for debugging
-      // The transaction confirmation below will catch actual failures
-      (async () => {
-        try {
-          // Wait a moment for transaction to propagate
-          await new Promise(resolve => setTimeout(resolve, 2000));
-          
-          let verificationAttempts = 0;
-          const maxVerificationAttempts = 5;
-          
-          while (verificationAttempts < maxVerificationAttempts) {
-            try {
-              const txStatus = await connection.getSignatureStatus(signature, {
-                searchTransactionHistory: true,
-              });
-              
-              if (txStatus.value !== null) {
-                console.log('Transaction verified on blockchain:', txStatus.value);
-                
-                // If transaction already failed, log it (confirmation will handle it)
-                if (txStatus.value.err) {
-                  console.error('Transaction error detected:', txStatus.value.err);
-                }
-                break;
-              }
-            } catch (verifyError: any) {
-              // Network errors during verification are not critical
-              // The transaction might still be processing
-              console.log(`Verification attempt ${verificationAttempts + 1} failed (non-critical):`, verifyError?.message || verifyError);
-            }
-            
-            await new Promise(resolve => setTimeout(resolve, 1000));
-            verificationAttempts++;
-          }
-        } catch (verifyError) {
-          // Verification errors are non-critical - transaction might still succeed
-          console.log('Transaction verification failed (non-critical):', verifyError);
-        }
-      })();
-      
-      const explorerUrl = `https://solscan.io/tx/${signature}?cluster=testnet`;
-      
-      // Show transaction sent message
-      toast.info('Transaction sent! Confirming...', {
-        description: `Signature: ${signature.slice(0, 8)}...${signature.slice(-8)}`,
+
+      const txUrl = getSolscanTxUrl(signature);
+
+      toast.success("Transfer submitted", {
+        description:
+          transferType === "internal"
+            ? `Private transfer • ${signature.slice(0, 8)}...${signature.slice(-8)}`
+            : `External transfer • ${signature.slice(0, 8)}...${signature.slice(-8)}`,
         action: {
-          label: 'View on Solscan',
-          onClick: () => window.open(explorerUrl, '_blank'),
+          label: "View on Solscan",
+          onClick: () => window.open(txUrl, "_blank"),
         },
         duration: 10000,
       });
 
-      // Confirm transaction using blockhash method (most reliable)
-      try {
-        const confirmation = await connection.confirmTransaction(
-          {
-            signature,
-            blockhash,
-            lastValidBlockHeight,
-          },
-          'confirmed'
-        );
-
-        // Check if transaction failed
-        if (confirmation.value.err) {
-          setIsConfirming(false);
-          toast.error('Payment failed', {
-            description: `Transaction error: ${JSON.stringify(confirmation.value.err)}`,
-          });
-          throw new Error(`Transaction failed: ${JSON.stringify(confirmation.value.err)}`);
-        }
-        
-        console.log('Transaction confirmed:', confirmation);
-        
-        // IMMEDIATELY update invoice status after confirmation
-        ensureInvoice(invoice);
-        updateInvoiceStatus(invoice.id, 'paid', publicKey.toBase58(), signature);
-        
-        // Update local state immediately
-        setInvoice(prev => ({
-          ...prev,
-          status: 'paid',
-          payerAddress: publicKey.toBase58(),
-          paidAt: new Date(),
-          transactionSignature: signature
-        }));
-        
-        setIsPaid(true);
-        setIsConfirming(false);
-        
-        // Show success toast immediately
-        toast.success('Payment confirmed!', {
-          description: 'Transaction confirmed on Solana Testnet',
-          action: {
-            label: 'View on Solscan',
-            onClick: () => window.open(explorerUrl, '_blank'),
-          },
-          duration: 10000,
+      if (transferType === "external") {
+        toast.message("Recipient not found for private transfer", {
+          description: "Sent as an external transfer (amount visible) to ensure delivery.",
+          duration: 8000,
         });
-        
-        return; // Exit early - payment is complete
-      } catch (confirmError: any) {
-        // If confirmTransaction times out or fails, fall back to polling
-        // This handles network issues and RPC latency
-        console.log('confirmTransaction timed out or failed, falling back to polling...', confirmError?.message || confirmError);
-        
-        let confirmed = false;
-        let attempts = 0;
-        const maxAttempts = 120; // 60 seconds max (120 * 500ms)
-        
-        while (!confirmed && attempts < maxAttempts) {
-          await new Promise(resolve => setTimeout(resolve, 500));
-          
-          try {
-            const status = await connection.getSignatureStatus(signature, {
-              searchTransactionHistory: true,
-            });
-            
-            if (status.value?.err) {
-              setIsConfirming(false);
-              toast.error('Payment failed', {
-                description: `Transaction error: ${JSON.stringify(status.value.err)}`,
-              });
-              throw new Error(`Transaction failed: ${JSON.stringify(status.value.err)}`);
-            }
-            
-            // Check if transaction is confirmed or finalized
-            if (status.value && (status.value.confirmationStatus === 'confirmed' || status.value.confirmationStatus === 'finalized')) {
-              confirmed = true;
-              console.log('Transaction confirmed via polling:', status.value);
-              
-              // IMMEDIATELY update invoice status after confirmation
-              ensureInvoice(invoice);
-              updateInvoiceStatus(invoice.id, 'paid', publicKey.toBase58(), signature);
-              
-              // Update local state immediately
-              setInvoice(prev => ({
-                ...prev,
-                status: 'paid',
-                payerAddress: publicKey.toBase58(),
-                paidAt: new Date(),
-                transactionSignature: signature
-              }));
-              
-              setIsPaid(true);
-              setIsConfirming(false);
-              
-              // Show success toast immediately
-              toast.success('Payment confirmed!', {
-                description: 'Transaction confirmed on Solana Testnet',
-                action: {
-                  label: 'View on Solscan',
-                  onClick: () => window.open(explorerUrl, '_blank'),
-                },
-                duration: 10000,
-              });
-              
-              break;
-            }
-          } catch (pollError: any) {
-            // Network errors during polling - log but continue
-            // Don't break the loop on network errors, transaction might still be processing
-            if (attempts % 10 === 0) { // Log every 5 seconds
-              console.log('Polling error (continuing):', pollError?.message || pollError);
-            }
-          }
-          
-          attempts++;
-        }
-
-        if (!confirmed) {
-          setIsConfirming(false);
-          // Check one more time if transaction exists (might have succeeded)
-          try {
-            const finalStatus = await connection.getSignatureStatus(signature, {
-              searchTransactionHistory: true,
-            });
-            
-            if (finalStatus.value && !finalStatus.value.err) {
-              // Transaction exists and succeeded!
-              // Ensure invoice exists in context before updating
-              ensureInvoice(invoice);
-              
-              updateInvoiceStatus(invoice.id, 'paid', publicKey.toBase58(), signature);
-              
-              // Update local state immediately
-              setInvoice(prev => ({
-                ...prev,
-                status: 'paid',
-                payerAddress: publicKey.toBase58(),
-                paidAt: new Date(),
-                transactionSignature: signature
-              }));
-              
-              setIsPaid(true);
-              setIsConfirming(false);
-              
-              // Show success toast immediately
-              toast.success('Payment confirmed!', {
-                description: 'Transaction confirmed on Solana Testnet',
-                action: {
-                  label: 'View on Solscan',
-                  onClick: () => window.open(explorerUrl, '_blank'),
-                },
-                duration: 10000,
-              });
-              return;
-            }
-          } catch (finalCheckError) {
-            console.log('Final check error:', finalCheckError);
-          }
-          
-          // If we get here, transaction might still be processing
-          toast.warning('Confirmation timeout', {
-            description: 'Transaction was sent but confirmation is taking longer than expected. Please check Solscan - it may still be processing.',
-            action: {
-              label: 'View on Solscan',
-              onClick: () => window.open(explorerUrl, '_blank'),
-            },
-            duration: 15000,
-          });
-          return;
-        }
       }
 
-      // This code should never be reached if confirmation worked above
-      // But keeping it as a fallback
-      ensureInvoice(invoice);
-      updateInvoiceStatus(invoice.id, 'paid', publicKey.toBase58(), signature);
-      
-      // Update local state immediately
-      setInvoice(prev => ({
-        ...prev,
-        status: 'paid',
-        payerAddress: publicKey.toBase58(),
-        paidAt: new Date(),
-        transactionSignature: signature
-      }));
-      
-      setIsPaid(true);
-      setIsConfirming(false);
-      
-      toast.success('Payment confirmed!', {
-        description: 'Transaction confirmed on Solana Testnet',
-        action: {
-          label: 'View on Solscan',
-          onClick: () => window.open(explorerUrl, '_blank'),
-        },
-        duration: 10000,
+      // Store pending immediately (prevents double-pay), then confirm before marking paid.
+      upsertInvoice({
+        ...invoice,
+        status: "pending",
+        payerAddress: sender,
+        transactionSignature: signature,
+        paymentMethod: "shadowwire",
+        isAnonymous: transferMode === "shadowwire_anonymous",
       });
+
+      const confirmed = await confirmSignature(signature, 120_000);
+      if (!confirmed) {
+        toast.warning("Waiting for confirmation", {
+          description: "Transfer submitted but not confirmed yet. Please check Solscan.",
+          action: {
+            label: "View on Solscan",
+            onClick: () => window.open(txUrl, "_blank"),
+          },
+          duration: 15000,
+        });
+        return;
+      }
+
+      upsertInvoice({
+        ...invoice,
+        status: "paid",
+        payerAddress: sender,
+        paidAt: new Date(),
+        transactionSignature: signature,
+        paymentMethod: "shadowwire",
+        isAnonymous: transferMode === "shadowwire_anonymous",
+      });
+
+      setInvoice((prev) => ({
+        ...prev,
+        status: "paid",
+        payerAddress: sender,
+        paidAt: new Date(),
+        transactionSignature: signature,
+        paymentMethod: "shadowwire",
+        isAnonymous: transferMode === "shadowwire_anonymous",
+      }));
+
+      setIsPaid(true);
+      await loadBalance(sender);
 
     } catch (error: any) {
-      console.error('Payment error:', error);
-      
-      // Reset states on error
-      setIsConfirming(false);
-      setIsProcessing(false);
-      
-      // Provide more specific error messages
-      let errorMessage = 'Payment failed. Please try again.';
-      let description = '';
-      
-      if (error.message) {
-        // Network-related errors
-        if (error.message.includes('Network request failed') || 
-            error.message.includes('fetch failed') || 
-            error.message.includes('Failed to fetch') ||
-            error.message.includes('NetworkError') ||
-            error.message.includes('network')) {
-          errorMessage = 'Network error';
-          description = 'There was a network issue. The transaction may have been sent. Please check Solscan or try again.';
-        } else if (error.message.includes('block height exceeded') || error.message.includes('expired') || error.message.includes('blockhash not found')) {
-          errorMessage = 'Transaction expired. Please try again.';
-          description = 'The transaction took too long. Please retry.';
-        } else if (error.message.includes('insufficient funds') || error.message.includes('Insufficient')) {
-          errorMessage = 'Insufficient funds';
-          description = 'Please check your wallet balance on Solana Testnet. You need enough SOL for the transfer plus transaction fees.';
-        } else if (error.message.includes('user rejected') || error.message.includes('User rejected')) {
-          errorMessage = 'Transaction cancelled';
-          description = 'You cancelled the transaction in your wallet.';
-        } else if (error.message.includes('timeout') || error.message.includes('not confirmed')) {
-          errorMessage = 'Transaction confirmation timeout';
-          description = transactionSignature 
-            ? `Transaction was sent but not confirmed. Check Solana Explorer: ${transactionSignature.slice(0, 8)}...`
-            : 'Transaction was sent but confirmation timed out. Please check Solana Explorer.';
-        } else {
-          errorMessage = error.message;
-          description = 'Make sure your wallet is connected to Solana Testnet.';
-        }
+      console.error("Payment error:", error);
+
+      if (error instanceof RecipientNotFoundError) {
+        setShadowWireError("Recipient not found. Try external transfer.");
+      } else if (error instanceof InsufficientBalanceError) {
+        setShadowWireError("Insufficient ShadowWire balance. Please deposit to the ShadowWire pool.");
+      } else {
+        setShadowWireError("Transfer failed: " + (error?.message ?? String(error)));
       }
-      
-      toast.error(errorMessage, {
-        description: description || 'Make sure your wallet is connected to Solana Testnet.',
+
+      toast.error("Transfer failed", {
+        description: error?.message ?? "Please try again.",
       });
     } finally {
       setIsProcessing(false);
@@ -437,10 +485,6 @@ export function PaymentForm({ invoice: initialInvoice }: PaymentFormProps) {
   };
 
   if (isPaid || invoice.status === 'paid') {
-    const explorerUrl = invoice.transactionSignature 
-      ? `https://solscan.io/tx/${invoice.transactionSignature}?cluster=testnet`
-      : null;
-    
     return (
       <motion.div
         initial={{ opacity: 0, scale: 0.95 }}
@@ -534,29 +578,14 @@ export function PaymentForm({ invoice: initialInvoice }: PaymentFormProps) {
         </div>
       </div>
 
-      {isConfirming ? (
+      {!wasmInitialized && !shadowWireError ? (
         <div className="space-y-4">
           <div className="p-6 rounded-lg bg-primary/10 border border-primary/20 text-center">
             <Loader2 className="h-8 w-8 animate-spin text-primary mx-auto mb-4" />
-            <h3 className="font-mono text-lg font-bold mb-2">Confirming Transaction...</h3>
-            <p className="text-sm text-muted-foreground mb-4">
-              Waiting for blockchain confirmation. This may take a few seconds.
+            <h3 className="font-mono text-lg font-bold mb-2">Initializing ShadowWire...</h3>
+            <p className="text-sm text-muted-foreground">
+              Preparing zero-knowledge proof system in your browser.
             </p>
-            {transactionSignature && (
-              <div className="space-y-2">
-                <p className="text-xs text-muted-foreground font-mono">
-                  Signature: {transactionSignature.slice(0, 16)}...{transactionSignature.slice(-8)}
-                </p>
-                <a
-                  href={`https://solscan.io/tx/${transactionSignature}?cluster=testnet`}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="text-xs text-primary hover:underline inline-block"
-                >
-                  View on Solana Explorer →
-                </a>
-              </div>
-            )}
           </div>
         </div>
       ) : !connected ? (
@@ -565,13 +594,88 @@ export function PaymentForm({ invoice: initialInvoice }: PaymentFormProps) {
           <WalletMultiButton className="!bg-primary !text-primary-foreground !font-mono !rounded-lg !h-12 !px-8 hover:!shadow-[0_0_20px_hsl(var(--primary)/0.4)] !transition-all !mx-auto" />
         </div>
       ) : (
-        <Button
-          variant="glow"
-          size="lg"
-          className="w-full group"
-          onClick={handlePayment}
-          disabled={isProcessing || isConfirming}
-        >
+        <div className="space-y-4">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <div className="p-3 rounded-lg bg-secondary/30 border border-border/50">
+              <p className="text-xs text-muted-foreground font-mono mb-2">Transfer</p>
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  type="button"
+                  size="sm"
+                  variant={transferMode === "normal" ? "glow" : "glass"}
+                  onClick={() => setTransferMode("normal")}
+                  disabled={isProcessing}
+                >
+                  Normal
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant={transferMode === "shadowwire_private" ? "glow" : "glass"}
+                  onClick={() => setTransferMode("shadowwire_private")}
+                  disabled={isProcessing}
+                >
+                  Private
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant={transferMode === "shadowwire_anonymous" ? "glow" : "glass"}
+                  onClick={() => setTransferMode("shadowwire_anonymous")}
+                  disabled={isProcessing}
+                >
+                  Anonymous
+                </Button>
+              </div>
+            </div>
+
+            <div className="p-3 rounded-lg bg-secondary/30 border border-border/50">
+              <p className="text-xs text-muted-foreground font-mono mb-2">Network</p>
+              <div className="flex gap-2">
+                <Button
+                  type="button"
+                  size="sm"
+                  variant={cluster === "devnet" ? "glow" : "glass"}
+                  onClick={() => switchNetwork("devnet")}
+                  disabled={isProcessing}
+                >
+                  Devnet
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant={cluster === "mainnet-beta" ? "glow" : "glass"}
+                  onClick={() => switchNetwork("mainnet-beta")}
+                  disabled={isProcessing}
+                >
+                  Mainnet
+                </Button>
+              </div>
+            </div>
+          </div>
+
+          {transferMode !== "normal" && balanceSOL !== null && (
+            <div className="p-3 rounded-lg bg-secondary/30 border border-border/50 text-center">
+              <p className="text-xs text-muted-foreground font-mono">ShadowWire Balance</p>
+              <p className="font-mono text-sm">
+                Available: <span className="text-foreground">{balanceSOL.toFixed(4)} SOL</span>
+              </p>
+            </div>
+          )}
+
+          {shadowWireError && (
+            <div className="p-3 rounded-lg bg-destructive/10 border border-destructive/20">
+              <p className="text-xs font-mono text-destructive text-center">{shadowWireError}</p>
+            </div>
+          )}
+
+          <Button
+            variant="glow"
+            size="lg"
+            className="w-full group"
+            onClick={handlePayment}
+            disabled={isProcessing || (transferMode !== "normal" && !wasmInitialized)}
+          >
           {isProcessing ? (
             <>
               <Loader2 className="h-4 w-4 animate-spin" />
@@ -583,20 +687,15 @@ export function PaymentForm({ invoice: initialInvoice }: PaymentFormProps) {
               <ArrowRight className="h-4 w-4 transition-transform group-hover:translate-x-1" />
             </>
           )}
-        </Button>
+          </Button>
+        </div>
       )}
 
       <div className="mt-4 space-y-2">
-        <div className="p-3 rounded-lg bg-yellow-500/10 border border-yellow-500/20">
-          <p className="text-xs font-mono text-yellow-400 text-center">
-            ⚠️ Make sure your wallet is set to <strong>Solana Testnet</strong>
-          </p>
-          <p className="text-xs text-muted-foreground text-center mt-1">
-            Switch network in your wallet settings if needed
-          </p>
-        </div>
         <p className="text-xs text-muted-foreground text-center">
-          Payments are processed on Solana Testnet • Get free testnet SOL from faucets
+          {transferMode === "normal"
+            ? `Normal transfer on Solana ${cluster}`
+            : "ShadowWire transfer on Solana Mainnet-Beta"}
         </p>
       </div>
     </motion.div>
