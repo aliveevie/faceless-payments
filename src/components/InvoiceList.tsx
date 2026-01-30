@@ -85,6 +85,21 @@ export function InvoiceList({ invoices }: InvoiceListProps) {
                 <p className="text-sm text-muted-foreground truncate">
                   {invoice.description || 'Payment request'}
                 </p>
+                {invoice.status === 'paid' && invoice.payerAddress && (
+                  <p className="text-xs text-muted-foreground mt-1 font-mono">
+                    Paid by: {invoice.payerAddress.slice(0, 8)}...{invoice.payerAddress.slice(-6)}
+                  </p>
+                )}
+                {invoice.status === 'paid' && invoice.transactionSignature && (
+                  <a
+                    href={`https://solscan.io/tx/${invoice.transactionSignature}?cluster=testnet`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-xs text-primary hover:underline mt-1 inline-block font-mono"
+                  >
+                    TX: {invoice.transactionSignature.slice(0, 8)}...{invoice.transactionSignature.slice(-6)}
+                  </a>
+                )}
               </div>
             </div>
 
