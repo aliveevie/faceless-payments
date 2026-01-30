@@ -23,7 +23,8 @@ interface InvoiceCardProps {
 export function InvoiceCard({ invoice, showActions = true }: InvoiceCardProps) {
   const [copied, setCopied] = useState(false);
   
-  const invoiceUrl = `${window.location.origin}/pay/${invoice.id}`;
+  // Include invoice data in URL query parameters so it can be accessed by anyone with the link
+  const invoiceUrl = `${window.location.origin}/pay/${invoice.id}?amount=${invoice.amount}&description=${encodeURIComponent(invoice.description || '')}&recipient=${encodeURIComponent(invoice.recipientAddress)}`;
   
   const copyToClipboard = async () => {
     await navigator.clipboard.writeText(invoiceUrl);
@@ -131,8 +132,58 @@ export function InvoiceCard({ invoice, showActions = true }: InvoiceCardProps) {
               </p>
             </div>
           )}
+
+          {invoice.status === 'paid' && invoice.paidAt && (
+            <div>
+              <p className="text-sm text-muted-foreground font-mono mb-1">Paid at</p>
+              <p className="text-sm text-foreground/80">
+                {invoice.paidAt.toLocaleString()}
+              </p>
+            </div>
+          )}
+
+          {invoice.status === 'paid' && invoice.transactionSignature && (
+            <div>
+              <p className="text-sm text-muted-foreground font-mono mb-1">Transaction</p>
+              <a
+                href={`https://solscan.io/tx/${invoice.transactionSignature}?cluster=testnet`}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="font-mono text-sm text-primary hover:underline inline-flex items-center gap-1"
+              >
+                {invoice.transactionSignature.slice(0, 16)}...{invoice.transactionSignature.slice(-8)}
+                <ExternalLink className="h-3 w-3" />
+              </a>
+            </div>
+          )}
         </div>
       </div>
+
+      {/* Paid Status Message */}
+      {invoice.status === 'paid' && (
+        <div className="mt-8 pt-6 border-t border-border/50">
+          <div className="p-4 rounded-lg bg-green-500/10 border border-green-500/20">
+            <div className="flex items-center gap-2 mb-2">
+              <CheckCircle2 className="h-5 w-5 text-green-400" />
+              <h3 className="font-mono font-bold text-green-400">Payment Complete</h3>
+            </div>
+            <p className="text-sm text-muted-foreground mb-3">
+              This invoice has been paid successfully. The payment has been confirmed on the blockchain.
+            </p>
+            {invoice.transactionSignature && (
+              <a
+                href={`https://solscan.io/tx/${invoice.transactionSignature}?cluster=testnet`}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-2 text-sm text-primary hover:underline font-mono"
+              >
+                View transaction on Solscan
+                <ExternalLink className="h-4 w-4" />
+              </a>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* Actions */}
       {showActions && invoice.status === 'pending' && (
