@@ -1,16 +1,27 @@
 import { useParams, Link } from 'react-router-dom';
 import { motion } from 'framer-motion';
+import { useEffect, useState } from 'react';
 import { Header } from '@/components/Header';
 import { InvoiceCard } from '@/components/InvoiceCard';
-import { useInvoices } from '@/contexts/InvoiceContext';
+import { PaymentForm } from '@/components/PaymentForm';
+import { useInvoices, Invoice } from '@/contexts/InvoiceContext';
 import { Button } from '@/components/ui/button';
 import { ArrowLeft, FileX } from 'lucide-react';
 
 const InvoiceDetails = () => {
   const { id } = useParams<{ id: string }>();
-  const { getInvoice } = useInvoices();
+  const { getInvoice, invoices } = useInvoices();
+  const [invoice, setInvoice] = useState<Invoice | undefined>(undefined);
   
-  const invoice = id ? getInvoice(id) : undefined;
+  // Watch for invoice updates in context
+  useEffect(() => {
+    if (id) {
+      const foundInvoice = getInvoice(id);
+      if (foundInvoice) {
+        setInvoice(foundInvoice);
+      }
+    }
+  }, [id, getInvoice, invoices]); // Re-run when invoices change
 
   return (
     <div className="min-h-screen bg-background">
@@ -30,7 +41,14 @@ const InvoiceDetails = () => {
           </Link>
 
           {invoice ? (
-            <InvoiceCard invoice={invoice} showActions={true} />
+            <>
+              <InvoiceCard invoice={invoice} showActions={true} />
+              {invoice.status === 'pending' && (
+                <div className="mt-6">
+                  <PaymentForm invoice={invoice} />
+                </div>
+              )}
+            </>
           ) : (
             <div className="glass-card p-12 text-center">
               <div className="w-16 h-16 rounded-full bg-destructive/10 flex items-center justify-center mx-auto mb-4">
