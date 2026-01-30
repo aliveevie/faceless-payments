@@ -6,22 +6,36 @@ import { Header } from '@/components/Header';
 import { InvoiceList } from '@/components/InvoiceList';
 import { useInvoices } from '@/contexts/InvoiceContext';
 import { Button } from '@/components/ui/button';
-import { Wallet, Plus, FileText, CheckCircle2, Clock } from 'lucide-react';
+import { Wallet, Plus, FileText, CheckCircle2, Clock, ArrowUpRight, ArrowDownRight } from 'lucide-react';
 
 const Dashboard = () => {
   const { connected, publicKey } = useWallet();
   const { invoices } = useInvoices();
 
-  // Filter invoices by current wallet
-  const myInvoices = connected && publicKey 
+  // Invoices where current user is the recipient (payments received)
+  const receivedInvoices = connected && publicKey 
     ? invoices.filter(inv => inv.recipientAddress === publicKey.toBase58())
     : [];
 
-  const pendingCount = myInvoices.filter(inv => inv.status === 'pending').length;
-  const paidCount = myInvoices.filter(inv => inv.status === 'paid').length;
-  const totalReceived = myInvoices
+  // Invoices where current user is the payer (payments made)
+  const paidInvoices = connected && publicKey 
+    ? invoices.filter(inv => inv.payerAddress === publicKey.toBase58() && inv.status === 'paid')
+    : [];
+
+  // Debug logging
+  console.log('Dashboard - Total invoices:', invoices.length);
+  console.log('Dashboard - Received invoices:', receivedInvoices);
+  console.log('Dashboard - Paid invoices:', paidInvoices);
+
+  // Stats for received invoices
+  const pendingCount = receivedInvoices.filter(inv => inv.status === 'pending').length;
+  const paidReceivedCount = receivedInvoices.filter(inv => inv.status === 'paid').length;
+  const totalReceived = receivedInvoices
     .filter(inv => inv.status === 'paid')
     .reduce((sum, inv) => sum + inv.amount, 0);
+
+  // Stats for payments made
+  const totalPaid = paidInvoices.reduce((sum, inv) => sum + inv.amount, 0);
 
   return (
     <div className="min-h-screen bg-background">
@@ -56,7 +70,7 @@ const Dashboard = () => {
           {connected ? (
             <>
               {/* Stats */}
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
+              <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
                 <motion.div
                   initial={{ opacity: 0, y: 20 }}
                   animate={{ opacity: 1, y: 0 }}
@@ -67,7 +81,7 @@ const Dashboard = () => {
                     <FileText className="h-5 w-5 text-muted-foreground" />
                     <span className="text-sm text-muted-foreground font-mono">Total Invoices</span>
                   </div>
-                  <p className="text-3xl font-bold font-mono">{myInvoices.length}</p>
+                  <p className="text-3xl font-bold font-mono">{receivedInvoices.length}</p>
                 </motion.div>
 
                 <motion.div
@@ -90,17 +104,64 @@ const Dashboard = () => {
                   className="glass-card p-6"
                 >
                   <div className="flex items-center gap-3 mb-2">
-                    <CheckCircle2 className="h-5 w-5 text-green-400" />
+                    <ArrowDownRight className="h-5 w-5 text-green-400" />
                     <span className="text-sm text-muted-foreground font-mono">Received</span>
                   </div>
                   <p className="text-3xl font-bold font-mono text-green-400">
                     {totalReceived.toFixed(2)} <span className="text-lg">SOL</span>
                   </p>
                 </motion.div>
+
+                <motion.div
+                  initial={{ opacity: 0, y: 20 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  transition={{ delay: 0.25 }}
+                  className="glass-card p-6"
+                >
+                  <div className="flex items-center gap-3 mb-2">
+                    <ArrowUpRight className="h-5 w-5 text-blue-400" />
+                    <span className="text-sm text-muted-foreground font-mono">Paid</span>
+                  </div>
+                  <p className="text-3xl font-bold font-mono text-blue-400">
+                    {totalPaid.toFixed(2)} <span className="text-lg">SOL</span>
+                  </p>
+                </motion.div>
               </div>
 
-              {/* Invoice List */}
-              <InvoiceList invoices={myInvoices} />
+              {/* Payments Received Section */}
+              <motion.div
+                initial={{ opacity: 0, y: 20 }}
+                animate={{ opacity: 1, y: 0 }}
+                transition={{ delay: 0.3 }}
+                className="mb-8"
+              >
+                <div className="flex items-center gap-3 mb-4">
+                  <ArrowDownRight className="h-5 w-5 text-green-400" />
+                  <h2 className="font-mono text-xl font-bold">Payments Received</h2>
+                  <span className="text-sm text-muted-foreground">
+                    ({paidReceivedCount} paid, {pendingCount} pending)
+                  </span>
+                </div>
+                <InvoiceList invoices={receivedInvoices} />
+              </motion.div>
+
+              {/* Payments Made Section */}
+              {paidInvoices.length > 0 && (
+                <motion.div
+                  initial={{ opacity: 0, y: 20 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  transition={{ delay: 0.35 }}
+                >
+                  <div className="flex items-center gap-3 mb-4">
+                    <ArrowUpRight className="h-5 w-5 text-blue-400" />
+                    <h2 className="font-mono text-xl font-bold">Payments Made</h2>
+                    <span className="text-sm text-muted-foreground">
+                      ({paidInvoices.length} invoices)
+                    </span>
+                  </div>
+                  <InvoiceList invoices={paidInvoices} />
+                </motion.div>
+              )}
             </>
           ) : (
             <motion.div
