@@ -1,31 +1,46 @@
-import { useState } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { QRCodeSVG } from 'qrcode.react';
 import { motion } from 'framer-motion';
 import { Button } from './ui/button';
-import { Invoice } from '@/contexts/InvoiceContext';
-import { 
-  Copy, 
-  Check, 
-  Share2, 
-  MessageCircle, 
+import { Invoice, useInvoices } from '@/contexts/InvoiceContext';
+import { Connection, PublicKey, LAMPORTS_PER_SOL } from '@solana/web3.js';
+import {
+  Copy,
+  Check,
+  Share2,
+  MessageCircle,
   ExternalLink,
   Clock,
   CheckCircle2,
-  XCircle
+  XCircle,
+  Loader2,
+  Radio
 } from 'lucide-react';
 import { toast } from 'sonner';
+import { getSolscanTxUrl } from '@/lib/solana';
 
 interface InvoiceCardProps {
   invoice: Invoice;
   showActions?: boolean;
 }
 
-export function InvoiceCard({ invoice, showActions = true }: InvoiceCardProps) {
+// Devnet RPC for verification
+const DEVNET_RPC = 'https://api.devnet.solana.com';
+const POLL_INTERVAL = 5000; // Check every 5 seconds
+
+export function InvoiceCard({ invoice: initialInvoice, showActions = true }: InvoiceCardProps) {
   const [copied, setCopied] = useState(false);
-  
-  // Include invoice data in URL query parameters so it can be accessed by anyone with the link
+  const [isChecking, setIsChecking] = useState(false);
+  const { upsertInvoice, invoices } = useInvoices();
+  const pollingRef = useRef<NodeJS.Timeout | null>(null);
+  const lastCheckedSigRef = useRef<string | null>(null);
+
+  // Get latest invoice from context
+  const invoice = invoices.find(inv => inv.id === initialInvoice.id) || initialInvoice;
+
+  // Include invoice data in URL query parameters
   const invoiceUrl = `${window.location.origin}/pay/${invoice.id}?amount=${invoice.amount}&description=${encodeURIComponent(invoice.description || '')}&recipient=${encodeURIComponent(invoice.recipientAddress)}`;
-  
+
   const copyToClipboard = async () => {
     await navigator.clipboard.writeText(invoiceUrl);
     setCopied(true);
@@ -42,6 +57,136 @@ export function InvoiceCard({ invoice, showActions = true }: InvoiceCardProps) {
     const text = `💸 Payment Request: ${invoice.amount} SOL\n${invoice.description}\n\nPay here: ${invoiceUrl}`;
     window.open(`https://wa.me/?text=${encodeURIComponent(text)}`, '_blank');
   };
+
+  // Check blockchain for payment
+  const checkForPayment = async (): Promise<boolean> => {
+    try {
+      const connection = new Connection(DEVNET_RPC, 'confirmed');
+      const recipientPubkey = new PublicKey(invoice.recipientAddress);
+
+      // Get recent signatures
+      const signatures = await connection.getSignaturesForAddress(recipientPubkey, { limit: 10 });
+
+      if (signatures.length === 0) return false;
+
+      // Skip if we already checked this signature
+      if (lastCheckedSigRef.current === signatures[0].signature) {
+        return false;
+      }
+
+      const invoiceLamports = Math.round(invoice.amount * LAMPORTS_PER_SOL);
+      const tolerance = 10000; // Allow small differences
+
+      for (const sig of signatures) {
+        // Skip already checked
+        if (sig.signature === lastCheckedSigRef.current) break;
+
+        try {
+          const tx = await connection.getTransaction(sig.signature, {
+            maxSupportedTransactionVersion: 0,
+          });
+
+          if (!tx || !tx.meta) continue;
+
+          const preBalances = tx.meta.preBalances;
+          const postBalances = tx.meta.postBalances;
+          const accountKeys = tx.transaction.message.getAccountKeys();
+
+          // Find recipient account
+          let recipientIndex = -1;
+          for (let i = 0; i < accountKeys.length; i++) {
+            if (accountKeys.get(i)?.toBase58() === invoice.recipientAddress) {
+              recipientIndex = i;
+              break;
+            }
+          }
+
+          if (recipientIndex === -1) continue;
+
+          const amountReceived = postBalances[recipientIndex] - preBalances[recipientIndex];
+
+          // Check if amount matches
+          if (Math.abs(amountReceived - invoiceLamports) <= tolerance) {
+            // Found payment!
+            const senderIndex = preBalances.findIndex((pre, i) =>
+              i !== recipientIndex && pre > postBalances[i]
+            );
+
+            const senderAddress = senderIndex >= 0
+              ? accountKeys.get(senderIndex)?.toBase58()
+              : undefined;
+
+            // Update invoice
+            upsertInvoice({
+              ...invoice,
+              status: 'paid',
+              payerAddress: senderAddress,
+              transactionSignature: sig.signature,
+              paidAt: new Date(sig.blockTime ? sig.blockTime * 1000 : Date.now()),
+              paymentMethod: 'normal',
+            });
+
+            toast.success('Payment received!', {
+              description: `${invoice.amount} SOL confirmed on blockchain`,
+              action: {
+                label: 'View',
+                onClick: () => window.open(getSolscanTxUrl(sig.signature), '_blank'),
+              },
+            });
+
+            return true;
+          }
+        } catch (err) {
+          console.warn('Error checking tx:', err);
+        }
+      }
+
+      // Update last checked
+      lastCheckedSigRef.current = signatures[0].signature;
+      return false;
+
+    } catch (err) {
+      console.warn('Payment check error:', err);
+      return false;
+    }
+  };
+
+  // Auto-poll for payments when invoice is pending
+  useEffect(() => {
+    if (invoice.status !== 'pending') {
+      // Clear polling if not pending
+      if (pollingRef.current) {
+        clearInterval(pollingRef.current);
+        pollingRef.current = null;
+      }
+      return;
+    }
+
+    // Start polling
+    const poll = async () => {
+      setIsChecking(true);
+      const found = await checkForPayment();
+      setIsChecking(false);
+
+      if (found && pollingRef.current) {
+        clearInterval(pollingRef.current);
+        pollingRef.current = null;
+      }
+    };
+
+    // Initial check
+    poll();
+
+    // Set up interval
+    pollingRef.current = setInterval(poll, POLL_INTERVAL);
+
+    return () => {
+      if (pollingRef.current) {
+        clearInterval(pollingRef.current);
+        pollingRef.current = null;
+      }
+    };
+  }, [invoice.status, invoice.id, invoice.amount, invoice.recipientAddress]);
 
   const getStatusBadge = () => {
     switch (invoice.status) {
@@ -61,9 +206,13 @@ export function InvoiceCard({ invoice, showActions = true }: InvoiceCardProps) {
         );
       default:
         return (
-          <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-primary/20 text-primary text-sm font-mono">
-            <Clock className="h-3.5 w-3.5" />
-            Pending
+          <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-yellow-500/20 text-yellow-400 text-sm font-mono">
+            {isChecking ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <Radio className="h-3.5 w-3.5 animate-pulse" />
+            )}
+            Awaiting Payment
           </span>
         );
     }
@@ -85,8 +234,8 @@ export function InvoiceCard({ invoice, showActions = true }: InvoiceCardProps) {
         {/* QR Code */}
         <div className="flex-shrink-0">
           <div className="p-4 bg-white rounded-xl">
-            <QRCodeSVG 
-              value={invoiceUrl} 
+            <QRCodeSVG
+              value={invoiceUrl}
               size={180}
               level="H"
               includeMargin={false}
@@ -128,7 +277,7 @@ export function InvoiceCard({ invoice, showActions = true }: InvoiceCardProps) {
             <div>
               <p className="text-sm text-muted-foreground font-mono mb-1">Paid by</p>
               <p className="font-mono text-sm truncate text-green-400">
-                {invoice.payerAddress}
+                {invoice.isAnonymous ? 'Anonymous' : invoice.payerAddress}
               </p>
             </div>
           )}
@@ -146,7 +295,7 @@ export function InvoiceCard({ invoice, showActions = true }: InvoiceCardProps) {
             <div>
               <p className="text-sm text-muted-foreground font-mono mb-1">Transaction</p>
               <a
-                href={`https://solscan.io/tx/${invoice.transactionSignature}?cluster=testnet`}
+                href={getSolscanTxUrl(invoice.transactionSignature)}
                 target="_blank"
                 rel="noopener noreferrer"
                 className="font-mono text-sm text-primary hover:underline inline-flex items-center gap-1"
@@ -158,6 +307,26 @@ export function InvoiceCard({ invoice, showActions = true }: InvoiceCardProps) {
           )}
         </div>
       </div>
+
+      {/* Live Monitoring Banner for Pending */}
+      {invoice.status === 'pending' && (
+        <div className="mt-6 p-3 rounded-lg bg-yellow-500/10 border border-yellow-500/20">
+          <div className="flex items-center gap-2">
+            <div className="relative">
+              <Radio className="h-4 w-4 text-yellow-400" />
+              <span className="absolute inset-0 animate-ping">
+                <Radio className="h-4 w-4 text-yellow-400 opacity-75" />
+              </span>
+            </div>
+            <p className="text-sm text-yellow-400 font-mono">
+              Monitoring blockchain for payment...
+            </p>
+          </div>
+          <p className="text-xs text-muted-foreground mt-1 ml-6">
+            Will update automatically when payment is detected
+          </p>
+        </div>
+      )}
 
       {/* Paid Status Message */}
       {invoice.status === 'paid' && (
@@ -172,7 +341,7 @@ export function InvoiceCard({ invoice, showActions = true }: InvoiceCardProps) {
             </p>
             {invoice.transactionSignature && (
               <a
-                href={`https://solscan.io/tx/${invoice.transactionSignature}?cluster=testnet`}
+                href={getSolscanTxUrl(invoice.transactionSignature)}
                 target="_blank"
                 rel="noopener noreferrer"
                 className="inline-flex items-center gap-2 text-sm text-primary hover:underline font-mono"
@@ -185,12 +354,12 @@ export function InvoiceCard({ invoice, showActions = true }: InvoiceCardProps) {
         </div>
       )}
 
-      {/* Actions */}
+      {/* Actions for Pending Invoices */}
       {showActions && invoice.status === 'pending' && (
         <div className="mt-8 pt-6 border-t border-border/50">
           <div className="flex flex-wrap gap-3">
-            <Button 
-              variant="glow" 
+            <Button
+              variant="glow"
               onClick={copyToClipboard}
               className="flex-1 min-w-[140px]"
             >
@@ -206,18 +375,18 @@ export function InvoiceCard({ invoice, showActions = true }: InvoiceCardProps) {
                 </>
               )}
             </Button>
-            
-            <Button 
-              variant="glass" 
+
+            <Button
+              variant="glass"
               onClick={shareToTelegram}
               className="flex-1 min-w-[140px]"
             >
               <MessageCircle className="h-4 w-4" />
               Telegram
             </Button>
-            
-            <Button 
-              variant="glass" 
+
+            <Button
+              variant="glass"
               onClick={shareToWhatsApp}
               className="flex-1 min-w-[140px]"
             >

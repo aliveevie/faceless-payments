@@ -9,6 +9,7 @@ import {
   ExternalLink, 
   FileText 
 } from 'lucide-react';
+import { getSolscanTxUrl } from '@/lib/solana';
 
 interface InvoiceListProps {
   invoices: Invoice[];
@@ -87,12 +88,12 @@ export function InvoiceList({ invoices }: InvoiceListProps) {
                 </p>
                 {invoice.status === 'paid' && invoice.payerAddress && (
                   <p className="text-xs text-muted-foreground mt-1 font-mono">
-                    Paid by: {invoice.payerAddress.slice(0, 8)}...{invoice.payerAddress.slice(-6)}
+                    Paid by: {invoice.isAnonymous ? 'Anonymous' : `${invoice.payerAddress.slice(0, 8)}...${invoice.payerAddress.slice(-6)}`}
                   </p>
                 )}
                 {invoice.status === 'paid' && invoice.transactionSignature && (
                   <a
-                    href={`https://solscan.io/tx/${invoice.transactionSignature}?cluster=testnet`}
+                    href={getSolscanTxUrl(invoice.transactionSignature)}
                     target="_blank"
                     rel="noopener noreferrer"
                     className="text-xs text-primary hover:underline mt-1 inline-block font-mono"
