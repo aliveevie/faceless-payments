@@ -27,20 +27,31 @@ const PayInvoice = () => {
       } else {
         // If not found in context, try to reconstruct from URL query parameters
         const amount = searchParams.get('amount');
+        const token = searchParams.get('token') as 'SOL' | 'USD1' | null;
         const description = searchParams.get('description');
         const recipient = searchParams.get('recipient');
-        
+        // Payment info (included in share URL after payment)
+        const status = searchParams.get('status') as 'pending' | 'paid' | null;
+        const txSig = searchParams.get('txSig');
+        const payer = searchParams.get('payer');
+
         if (amount && recipient) {
           // Reconstruct invoice from URL parameters
           const tempInvoice: Invoice = {
             id: id,
             amount: parseFloat(amount),
+            token: token || 'SOL',
             description: description || 'Payment request',
             recipientAddress: recipient,
             createdAt: new Date(),
-            status: 'pending' as const,
+            status: status === 'paid' ? 'paid' : 'pending',
+            // Include payment info if available from URL
+            transactionSignature: txSig || undefined,
+            payerAddress: payer || undefined,
+            paidAt: status === 'paid' ? new Date() : undefined,
+            isAnonymous: status === 'paid' && !payer, // Anonymous if paid but no payer shown
           };
-          
+
           // CRITICAL: Ensure invoice exists in context so it can be updated when paid
           foundInvoice = ensureInvoice(tempInvoice);
           setInvoice(foundInvoice);

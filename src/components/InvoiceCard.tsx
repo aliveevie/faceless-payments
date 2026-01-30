@@ -1,20 +1,20 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState } from 'react';
 import { QRCodeSVG } from 'qrcode.react';
 import { motion } from 'framer-motion';
 import { Button } from './ui/button';
 import { Invoice, useInvoices } from '@/contexts/InvoiceContext';
-import { Connection, PublicKey, LAMPORTS_PER_SOL } from '@solana/web3.js';
 import {
   Copy,
   Check,
   Share2,
   MessageCircle,
   ExternalLink,
-  Clock,
   CheckCircle2,
   XCircle,
-  Loader2,
-  Radio
+  Radio,
+  Shield,
+  EyeOff,
+  Zap
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { getSolscanTxUrl } from '@/lib/solana';
@@ -24,22 +24,23 @@ interface InvoiceCardProps {
   showActions?: boolean;
 }
 
-// Devnet RPC for verification
-const DEVNET_RPC = 'https://api.devnet.solana.com';
-const POLL_INTERVAL = 5000; // Check every 5 seconds
-
 export function InvoiceCard({ invoice: initialInvoice, showActions = true }: InvoiceCardProps) {
   const [copied, setCopied] = useState(false);
-  const [isChecking, setIsChecking] = useState(false);
-  const { upsertInvoice, invoices } = useInvoices();
-  const pollingRef = useRef<NodeJS.Timeout | null>(null);
-  const lastCheckedSigRef = useRef<string | null>(null);
+  const { invoices } = useInvoices();
 
   // Get latest invoice from context
   const invoice = invoices.find(inv => inv.id === initialInvoice.id) || initialInvoice;
 
+  // Invoice token (SOL or USD1)
+  const invoiceToken = invoice.token || 'SOL';
+
   // Include invoice data in URL query parameters
-  const invoiceUrl = `${window.location.origin}/pay/${invoice.id}?amount=${invoice.amount}&description=${encodeURIComponent(invoice.description || '')}&recipient=${encodeURIComponent(invoice.recipientAddress)}`;
+  // When paid, include payment info so recipient can see the paid status
+  const baseUrl = `${window.location.origin}/pay/${invoice.id}?amount=${invoice.amount}&token=${invoiceToken}&description=${encodeURIComponent(invoice.description || '')}&recipient=${encodeURIComponent(invoice.recipientAddress)}`;
+  const paymentParams = invoice.status === 'paid'
+    ? `&status=paid${invoice.transactionSignature ? `&txSig=${invoice.transactionSignature}` : ''}${invoice.payerAddress && !invoice.isAnonymous ? `&payer=${invoice.payerAddress}` : ''}`
+    : '';
+  const invoiceUrl = baseUrl + paymentParams;
 
   const copyToClipboard = async () => {
     await navigator.clipboard.writeText(invoiceUrl);
@@ -49,144 +50,14 @@ export function InvoiceCard({ invoice: initialInvoice, showActions = true }: Inv
   };
 
   const shareToTelegram = () => {
-    const text = `💸 Payment Request: ${invoice.amount} SOL\n${invoice.description}\n\nPay here: ${invoiceUrl}`;
+    const text = `💸 Payment Request: ${invoice.amount} ${invoiceToken}\n${invoice.description}\n\nPay here: ${invoiceUrl}`;
     window.open(`https://t.me/share/url?url=${encodeURIComponent(invoiceUrl)}&text=${encodeURIComponent(text)}`, '_blank');
   };
 
   const shareToWhatsApp = () => {
-    const text = `💸 Payment Request: ${invoice.amount} SOL\n${invoice.description}\n\nPay here: ${invoiceUrl}`;
+    const text = `💸 Payment Request: ${invoice.amount} ${invoiceToken}\n${invoice.description}\n\nPay here: ${invoiceUrl}`;
     window.open(`https://wa.me/?text=${encodeURIComponent(text)}`, '_blank');
   };
-
-  // Check blockchain for payment
-  const checkForPayment = async (): Promise<boolean> => {
-    try {
-      const connection = new Connection(DEVNET_RPC, 'confirmed');
-      const recipientPubkey = new PublicKey(invoice.recipientAddress);
-
-      // Get recent signatures
-      const signatures = await connection.getSignaturesForAddress(recipientPubkey, { limit: 10 });
-
-      if (signatures.length === 0) return false;
-
-      // Skip if we already checked this signature
-      if (lastCheckedSigRef.current === signatures[0].signature) {
-        return false;
-      }
-
-      const invoiceLamports = Math.round(invoice.amount * LAMPORTS_PER_SOL);
-      const tolerance = 10000; // Allow small differences
-
-      for (const sig of signatures) {
-        // Skip already checked
-        if (sig.signature === lastCheckedSigRef.current) break;
-
-        try {
-          const tx = await connection.getTransaction(sig.signature, {
-            maxSupportedTransactionVersion: 0,
-          });
-
-          if (!tx || !tx.meta) continue;
-
-          const preBalances = tx.meta.preBalances;
-          const postBalances = tx.meta.postBalances;
-          const accountKeys = tx.transaction.message.getAccountKeys();
-
-          // Find recipient account
-          let recipientIndex = -1;
-          for (let i = 0; i < accountKeys.length; i++) {
-            if (accountKeys.get(i)?.toBase58() === invoice.recipientAddress) {
-              recipientIndex = i;
-              break;
-            }
-          }
-
-          if (recipientIndex === -1) continue;
-
-          const amountReceived = postBalances[recipientIndex] - preBalances[recipientIndex];
-
-          // Check if amount matches
-          if (Math.abs(amountReceived - invoiceLamports) <= tolerance) {
-            // Found payment!
-            const senderIndex = preBalances.findIndex((pre, i) =>
-              i !== recipientIndex && pre > postBalances[i]
-            );
-
-            const senderAddress = senderIndex >= 0
-              ? accountKeys.get(senderIndex)?.toBase58()
-              : undefined;
-
-            // Update invoice
-            upsertInvoice({
-              ...invoice,
-              status: 'paid',
-              payerAddress: senderAddress,
-              transactionSignature: sig.signature,
-              paidAt: new Date(sig.blockTime ? sig.blockTime * 1000 : Date.now()),
-              paymentMethod: 'normal',
-            });
-
-            toast.success('Payment received!', {
-              description: `${invoice.amount} SOL confirmed on blockchain`,
-              action: {
-                label: 'View',
-                onClick: () => window.open(getSolscanTxUrl(sig.signature), '_blank'),
-              },
-            });
-
-            return true;
-          }
-        } catch (err) {
-          console.warn('Error checking tx:', err);
-        }
-      }
-
-      // Update last checked
-      lastCheckedSigRef.current = signatures[0].signature;
-      return false;
-
-    } catch (err) {
-      console.warn('Payment check error:', err);
-      return false;
-    }
-  };
-
-  // Auto-poll for payments when invoice is pending
-  useEffect(() => {
-    if (invoice.status !== 'pending') {
-      // Clear polling if not pending
-      if (pollingRef.current) {
-        clearInterval(pollingRef.current);
-        pollingRef.current = null;
-      }
-      return;
-    }
-
-    // Start polling
-    const poll = async () => {
-      setIsChecking(true);
-      const found = await checkForPayment();
-      setIsChecking(false);
-
-      if (found && pollingRef.current) {
-        clearInterval(pollingRef.current);
-        pollingRef.current = null;
-      }
-    };
-
-    // Initial check
-    poll();
-
-    // Set up interval
-    pollingRef.current = setInterval(poll, POLL_INTERVAL);
-
-    return () => {
-      if (pollingRef.current) {
-        clearInterval(pollingRef.current);
-        pollingRef.current = null;
-      }
-    };
-  }, [invoice.status, invoice.id, invoice.amount, invoice.recipientAddress]);
 
   const getStatusBadge = () => {
     switch (invoice.status) {
@@ -207,11 +78,7 @@ export function InvoiceCard({ invoice: initialInvoice, showActions = true }: Inv
       default:
         return (
           <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-yellow-500/20 text-yellow-400 text-sm font-mono">
-            {isChecking ? (
-              <Loader2 className="h-3.5 w-3.5 animate-spin" />
-            ) : (
-              <Radio className="h-3.5 w-3.5 animate-pulse" />
-            )}
+            <Radio className="h-3.5 w-3.5 animate-pulse" />
             Awaiting Payment
           </span>
         );
@@ -248,7 +115,7 @@ export function InvoiceCard({ invoice: initialInvoice, showActions = true }: Inv
           <div>
             <p className="text-sm text-muted-foreground font-mono mb-1">Amount</p>
             <p className="text-4xl font-bold font-mono text-gradient">
-              {invoice.amount} <span className="text-xl">SOL</span>
+              {invoice.amount} <span className="text-xl">{invoiceToken}</span>
             </p>
           </div>
 
@@ -282,6 +149,29 @@ export function InvoiceCard({ invoice: initialInvoice, showActions = true }: Inv
             </div>
           )}
 
+          {invoice.status === 'paid' && invoice.paymentMethod && (
+            <div>
+              <p className="text-sm text-muted-foreground font-mono mb-1">Payment Method</p>
+              <span className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs font-mono ${
+                invoice.paymentMethod === 'shadowwire'
+                  ? invoice.isAnonymous
+                    ? 'bg-purple-500/20 text-purple-400'
+                    : 'bg-blue-500/20 text-blue-400'
+                  : 'bg-gray-500/20 text-gray-400'
+              }`}>
+                {invoice.paymentMethod === 'shadowwire' ? (
+                  invoice.isAnonymous ? (
+                    <><EyeOff className="h-3 w-3" /> Anonymous (ShadowWire)</>
+                  ) : (
+                    <><Shield className="h-3 w-3" /> Private (ShadowWire)</>
+                  )
+                ) : (
+                  <><Zap className="h-3 w-3" /> Normal Transfer</>
+                )}
+              </span>
+            </div>
+          )}
+
           {invoice.status === 'paid' && invoice.paidAt && (
             <div>
               <p className="text-sm text-muted-foreground font-mono mb-1">Paid at</p>
@@ -308,7 +198,7 @@ export function InvoiceCard({ invoice: initialInvoice, showActions = true }: Inv
         </div>
       </div>
 
-      {/* Live Monitoring Banner for Pending */}
+      {/* Pending Status Message */}
       {invoice.status === 'pending' && (
         <div className="mt-6 p-3 rounded-lg bg-yellow-500/10 border border-yellow-500/20">
           <div className="flex items-center gap-2">
@@ -319,11 +209,11 @@ export function InvoiceCard({ invoice: initialInvoice, showActions = true }: Inv
               </span>
             </div>
             <p className="text-sm text-yellow-400 font-mono">
-              Monitoring blockchain for payment...
+              Awaiting payment...
             </p>
           </div>
           <p className="text-xs text-muted-foreground mt-1 ml-6">
-            Will update automatically when payment is detected
+            Share this invoice link. Payment will update automatically.
           </p>
         </div>
       )}
@@ -332,12 +222,33 @@ export function InvoiceCard({ invoice: initialInvoice, showActions = true }: Inv
       {invoice.status === 'paid' && (
         <div className="mt-8 pt-6 border-t border-border/50">
           <div className="p-4 rounded-lg bg-green-500/10 border border-green-500/20">
-            <div className="flex items-center gap-2 mb-2">
-              <CheckCircle2 className="h-5 w-5 text-green-400" />
-              <h3 className="font-mono font-bold text-green-400">Payment Complete</h3>
+            <div className="flex items-center justify-between mb-2">
+              <div className="flex items-center gap-2">
+                <CheckCircle2 className="h-5 w-5 text-green-400" />
+                <h3 className="font-mono font-bold text-green-400">Payment Complete</h3>
+              </div>
+              {invoice.paymentMethod === 'shadowwire' && (
+                <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-mono ${
+                  invoice.isAnonymous
+                    ? 'bg-purple-500/20 text-purple-400'
+                    : 'bg-blue-500/20 text-blue-400'
+                }`}>
+                  {invoice.isAnonymous ? (
+                    <><EyeOff className="h-3 w-3" /> Anonymous</>
+                  ) : (
+                    <><Shield className="h-3 w-3" /> Private</>
+                  )}
+                </span>
+              )}
             </div>
             <p className="text-sm text-muted-foreground mb-3">
-              This invoice has been paid successfully. The payment has been confirmed on the blockchain.
+              {invoice.paymentMethod === 'shadowwire' ? (
+                invoice.isAnonymous
+                  ? 'This payment was made anonymously using ShadowWire.'
+                  : 'This payment was made privately with hidden amount via ShadowWire.'
+              ) : (
+                'This invoice has been paid and confirmed on Solana mainnet.'
+              )}
             </p>
             {invoice.transactionSignature && (
               <a
