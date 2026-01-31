@@ -3,9 +3,56 @@
 **Privacy-first invoicing on Solana.** Create invoices in **SOL** or **USD1**, share a link/QR, and let clients pay with **amount privacy** or **full anonymity** using **ShadowWire**.
 
 - **Live demo**: [faceless.ibxlab.com](https://faceless.ibxlab.com/)
-- **Demo video**: [YouTube](https://youtu.be/UPMZ4cpz7C8)
+- **Presentation Demo**:[Youtube](https://youtu.be/fA1_Ur6cyq4)
+- **Demo video**: [YouTube](https://youtu.be/E2jhhwCVuqc)
 - **Radr Labs PR**: [aliveevie/faceless-payments#1](https://github.com/aliveevie/faceless-payments/pull/1)
 - **ShadowWire**: [radr.dev/shadowwire](https://radr.dev/shadowwire)
+
+## Radr Labs / ShadowWire integration (full)
+
+This project is a **full end-to-end integration** of Radr Labs’ **ShadowWire** privacy rails into a real invoicing flow (create → share → pay → verify → withdraw).
+
+- **SDK**: `@radr/shadowwire` (used directly from the app)
+- **Networks**: **Solana mainnet-beta** (ShadowWire is mainnet-only)
+- **Tokens supported**:
+  - **SOL** (native)
+  - **USD1** (stablecoin invoices)
+- **Payment modes**:
+  - **Private**: amount hidden
+  - **Anonymous**: amount + sender hidden
+- **Pool management UX**:
+  - **Deposit** when pool balance is insufficient
+  - **Withdraw** from pool back to wallet (Dashboard)
+- **Verification UX**:
+  - in-app **Solscan** link
+  - automatic payment verification to mark invoices as paid
+
+### Where the integration lives (code map)
+
+- **ShadowWire transfers + verification**: `src/components/PaymentForm.tsx`
+- **Pool deposit/withdraw UI**: `src/components/ShadowWirePool.tsx`
+- **Tokenized invoices (SOL/USD1)**: `src/contexts/InvoiceContext.tsx`, `src/components/CreateInvoiceForm.tsx`
+- **Share links w/ paid metadata**: `src/components/InvoiceCard.tsx`, `src/pages/PayInvoice.tsx`
+- **Mainnet wallet/RPC**: `src/contexts/WalletContext.tsx` (uses `VITE_SOLANA_RPC_URL`)
+- **Solana helpers**: `src/lib/solana.ts`
+
+### End-to-end test plan (for judges)
+
+1. **Create invoice** (Dashboard → New Invoice):
+   - Choose **SOL** or **USD1**
+   - Enter amount above minimum (table below)
+   - Share invoice link/QR
+2. **Pay invoice** (open `/pay/:id` link):
+   - Connect wallet (mainnet)
+   - Choose **Private** or **Anonymous**
+   - If prompted, **deposit** to ShadowWire pool
+   - Submit payment
+3. **Verify**:
+   - Click **View on Solscan** inside the UI
+   - Confirm the payment reflects the chosen privacy mode
+4. **Withdraw**:
+   - Go back to Dashboard
+   - Use **ShadowWire Pool** to withdraw remaining balance
 
 ## Why this matters
 
